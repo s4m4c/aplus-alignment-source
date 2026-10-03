@@ -1,0 +1,2388 @@
+//@version=6
+// =======================================================================================
+//  LOU A+ SETUP DETECTOR - V1.6 (TradingView strategy)
+//
+//  Range -> liquidity sweep -> reclaim -> entry -> target
+//
+//  Four independent range setups, each with its own on/off switch, its own time windows
+//  and its own trade counter. All four follow exactly the same rules:
+//
+//    ASIA    02:00-06:00   entries 06:00-10:00
+//    LONDON  07:12-08:12   entries 08:12-10:00
+//    LUNCH   12:00-13:00   entries 13:00-14:15
+//    NY      14:12-15:12   entries 15:30-16:30
+//
+//  Entry models (shared by all four)
+//    1  OB   first M5 candle closing outside the range becomes the orderblock.
+//            Entry on the close back beyond that OB and inside the range.
+//    2  FIB  fib from the sweep extreme to the reclaim extreme, limit at 0.618.
+//
+//  Stop loss, take-profit model, no-trade zone, session locks and risk sizing apply
+//  to all four ranges in the same way.
+//
+//  Legacy models (off by default, kept for comparison)
+//    Asia OB with R-based targets, and the original London model with the Asia
+//    location filter plus double sweep.
+//
+//  Chart   M5. Ranges, sweeps, limit fills and SL/TP resolution come from M1 intrabars
+//          (request.security_lower_tf), so the xx:12 ranges are exact.
+//  Time    Europe/Vienna including DST, no broker offset needed.
+//  Repaint All logic runs on confirmed bars only. No lookahead, no future data.
+//
+//  See KNOWN LIMITS at the end of the file.
+// =======================================================================================
+strategy("Lou-A+ V1.9.6", shorttitle = "Lou-A+ 196", overlay = true, process_orders_on_close = true, pyramiding = 10, initial_capital = 10000, margin_long = 0, margin_short = 0, default_qty_type = strategy.fixed, default_qty_value = 1, commission_value = 0, slippage = 0, use_bar_magnifier = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 0. KONSTANTEN
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// --- States -----------------------------------------------------------------------------
+const int ST_IDLE          = 0
+const int ST_BUILD_ASIA    = 1
+const int ST_BUILD_PRE     = 2
+const int ST_WAIT_SWEEP    = 3
+const int ST_WAIT_RECLAIM  = 4
+const int ST_WAIT_ENTRY    = 5
+const int ST_CUTOFF        = 6
+const int ST_MAX_TRADES    = 7
+const int ST_INVALID_LOC   = 8
+const int ST_NO_DATA       = 9
+
+// --- Asia-OB States ---------------------------------------------------------------------
+const int AS_WAIT_RANGE    = 0
+const int AS_WAIT_SWEEP    = 1
+const int AS_WAIT_RECLAIM  = 2
+const int AS_CUTOFF        = 3
+const int AS_MAX_TRADES    = 4
+
+// --- Optionen ---------------------------------------------------------------------------
+const string DS_REQ  = "Required (sweep Asia + Pre)"
+const string DS_OPT  = "Optional (Asia is enough, Pre is flagged)"
+const string OB_WICK = "OB low / high (wick)"
+const string OB_BODY = "OB body (open / close)"
+const string TP_DUAL = "Dual TP  (TP1 + TP2)"
+const string TP_FULL = "Single TP  Full range (100 % / opposite side)"
+const string TP_HALF = "Single TP  50 % (range mid)"
+const string TP_CUST = "Single TP  Custom %"
+const string ATP_DUAL   = "Dual TP  (TP1 + TP2 in R)"
+const string ATP_SINGLE = "Single TP  (TP2 in R)"
+const string LOCK_FIRST = "First TP (TP1 or single TP)"
+const string LOCK_FINAL = "Final TP only"
+const string LOCK_OFF   = "Off"
+
+const string G_SESS   = "2 Timezone"
+const string G_RA     = "3a Asia range"
+const string G_RL     = "3b London range"
+const string G_LOC    = "7b Legacy London"
+const string G_OB     = "4a Entry model 1: Orderblock reclaim"
+const string G_FIB    = "4b Entry model 2: Fib retrace limit"
+const string G_AOB    = "7a Legacy Asia OB"
+const string G_STRAT  = "1 Risk & account"
+const string G_NY     = "3d NY range"
+const string G_LUN    = "3c Lunch range"
+const string G_LOCK   = "6b Session locks"
+const string G_NTZ    = "6c No-trade zone (50 % mark)"
+const string G_RISK   = "6a Stop loss / Take profit (all models)"
+const string G_ENG    = "4c Entry model 3: 3-candle engulfing"
+const string G_FIV    = "4d Entry model 4: FVG inversion"
+const string G_LIQ    = "5 Liquidity filters (model 1 only)"
+const string G_VIS    = "8 Visuals"
+const string G_COL    = "9 Colors"
+const string G_DBG    = "10 Debug"
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 1  RISIKO & KONTO
+// ───────────────────────────────────────────────────────────────────────────────────────
+float  riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, step = 0.1, group = G_STRAT, tooltip = "Position size = equity x risk % / (SL distance x point value).")
+int    btStartY  = input.int(2026, "Backtest from year", minval = 2000, maxval = 2100, group = G_STRAT, inline = "bt")
+int    btStartM  = input.int(1, "Month", minval = 1, maxval = 12, group = G_STRAT, inline = "bt")
+int    btStartD  = input.int(1, "Day", minval = 1, maxval = 31, group = G_STRAT, inline = "bt", tooltip = "Nothing is calculated before this date. Saves compute time.")
+float  fixedQty  = input.float(0.0, "Fixed order size (0 = risk-based sizing)", minval = 0, step = 0.01, group = G_STRAT, tooltip = "Fallback for symbols whose point value yields no usable size.")
+float  lotStep   = input.float(0.01, "Min. lot step", minval = 0.0001, step = 0.01, group = G_STRAT)
+int    dayMaxSL   = input.int(0, "Stop for the day after X stop-losses (0 = off)", minval = 0, maxval = 10, group = G_STRAT, tooltip = "Counts full stop-losses across all ranges; then no new trades that day.")
+bool   dayStopTP  = input.bool(false, "Stop for the day after one full target", group = G_STRAT, tooltip = "A trade reaching its final target ends the trading day.")
+bool   flattenOrph = input.bool(true, "Close positions the script no longer tracks", group = G_STRAT, tooltip = "Closes a leftover position that the script no longer tracks for two bars. Guards against rounding residues.")
+bool   allowCounter = input.bool(false, "Allow counter-direction trades", group = G_STRAT, tooltip = "Off: no trade against an open position. On: block lifted - careful, TradingView holds one net position.")
+string lockMode  = input.string(LOCK_OFF, "Stop trading for the day after", options = [LOCK_FIRST, LOCK_FINAL, LOCK_OFF], group = G_STRAT, tooltip = "Once reached, no new trades for the rest of the day.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 2  ZEITZONE
+// ───────────────────────────────────────────────────────────────────────────────────────
+string tzInput       = input.string("Europe/Vienna", "Timezone", options = ["Europe/Vienna", "Europe/Berlin", "UTC+1"], group = G_SESS, tooltip = "Vienna and Berlin follow CET incl. DST. UTC+1 is fixed CET.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 3a ASIA RANGE
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useAsia       = input.bool(true, "Asia range active", group = G_RA, tooltip = "Standalone range setup: sweep of the Asia high or low, OB reclaim or fib limit, targets measured on the Asia range. No location condition.")
+string asiaSessInput = input.session("0200-0600", "Asia range", group = G_RA, tooltip = "Start inclusive, end exclusive. Sessions crossing midnight are not supported.")
+string asiaWinInput  = input.session("0600-1000", "Entry window", group = G_RA)
+int    asiaFibEndH   = input.int(11, "Fib limit valid until", minval = 0, maxval = 23, group = G_RA, inline = "afe")
+int    asiaFibEndM   = input.int(0, ":", minval = 0, maxval = 59, group = G_RA, inline = "afe")
+float  sweepDistPct  = input.float(0.0, "Min. sweep distance (% of range)", minval = 0, step = 0.5, group = G_RA, tooltip = "How far price must trade beyond the range high/low before the sweep counts, as a % of the range height. 0 = one tick is enough.")
+float  asiaObDepth   = input.float(25.0, "OB: max. entry depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_RA, tooltip = "How deep inside the range the triggering close may sit, measured from the swept side. Deeper closes are skipped.")
+float  asiaFibDepth  = input.float(50.0, "Fib: min. reclaim depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_RA, tooltip = "The fib model only arms once the reclaim candle closes at least this deep into the range.")
+int    asiaMaxTrades = input.int(2, "Max. trades per Asia session", minval = 1, maxval = 5, group = G_RA)
+int    asiaCloseH    = input.int(11, "Force-close open trades at", minval = 0, maxval = 23, group = G_RA, inline = "acl")
+int    asiaCloseM    = input.int(0, ":", minval = 0, maxval = 59, group = G_RA, inline = "acl", tooltip = "Any trade from this range still open at this time is closed at market. Set the hour to 0 to switch it off.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 3b LONDON RANGE
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useLdn        = input.bool(true, "London range active", group = G_RL, tooltip = "Standalone range setup on the London pre-range, same rules as lunch and NY. The old location + double-sweep model lives in group 7b.")
+string preSessInput  = input.session("0712-0812", "London range", group = G_RL)
+string ldnEntryInput = input.session("0812-1000", "Entry window", group = G_RL)
+int    ldnFibEndH    = input.int(11, "Fib limit valid until", minval = 0, maxval = 23, group = G_RL, inline = "lfe")
+int    ldnFibEndM    = input.int(0, ":", minval = 0, maxval = 59, group = G_RL, inline = "lfe")
+float  ldnSweepDist  = input.float(0.0, "Min. sweep distance (% of range)", minval = 0, step = 0.5, group = G_RL)
+float  ldnObDepth    = input.float(25.0, "OB: max. entry depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_RL)
+float  ldnFibDepth   = input.float(50.0, "Fib: min. reclaim depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_RL)
+int    maxTradesInput = input.int(2, "Max. trades per London session", minval = 1, maxval = 5, group = G_RL)
+int    ldnCloseH      = input.int(11, "Force-close open trades at", minval = 0, maxval = 23, group = G_RL, inline = "lcl")
+int    ldnCloseM      = input.int(0, ":", minval = 0, maxval = 59, group = G_RL, inline = "lcl")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 3c LUNCH RANGE
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useLunch        = input.bool(true, "Lunch range setup active", group = G_LUN, tooltip = "Standalone like NY: no location condition, only a sweep of the lunch range, OB and fib entries, targets measured on the lunch range.")
+string lunchSessInput  = input.session("1200-1300", "Lunch range", group = G_LUN)
+string lunchEntryInput = input.session("1300-1415", "Entry window", group = G_LUN)
+int    lunchFibEndH    = input.int(15, "Fib limit valid until", minval = 0, maxval = 23, group = G_LUN, inline = "lue")
+int    lunchFibEndM    = input.int(0, ":", minval = 0, maxval = 59, group = G_LUN, inline = "lue")
+float  lunchSweepDist  = input.float(0.0, "Min. sweep distance (% of range)", minval = 0, step = 0.5, group = G_LUN)
+float  lunchObDepth    = input.float(25.0, "OB: max. entry depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_LUN)
+float  lunchFibDepth   = input.float(50.0, "Fib: min. reclaim depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_LUN)
+int    lunchMaxTrades  = input.int(2, "Max. trades per lunch session", minval = 1, maxval = 5, group = G_LUN)
+int    lunchCloseH     = input.int(0, "Force-close open trades at", minval = 0, maxval = 23, group = G_LUN, inline = "ucl")
+int    lunchCloseM     = input.int(0, ":", minval = 0, maxval = 59, group = G_LUN, inline = "ucl", tooltip = "Hour 0 = off.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 3d NY RANGE
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useNY          = input.bool(true, "NY pre-range setup active", group = G_NY, tooltip = "Standalone range: sweep of its own range plus OB reclaim. No location condition.")
+string nyPreSessInput = input.session("1412-1512", "NY pre-range", group = G_NY)
+string nyEntrySessInput = input.session("1530-1630", "Entry window", group = G_NY, tooltip = "After it ends: no new NY trades, pending limits are cancelled, open trades run to SL/TP.")
+int    nyFibEndH      = input.int(18, "Fib limit valid until", minval = 0, maxval = 23, group = G_NY, inline = "nfe")
+int    nyFibEndM      = input.int(0, ":", minval = 0, maxval = 59, group = G_NY, inline = "nfe", tooltip = "If the reclaim happened inside the entry window, the fib limit may be placed and filled until this time. After that it is cancelled.")
+float  nySweepDist    = input.float(0.0, "Min. sweep distance (% of range)", minval = 0, step = 0.5, group = G_NY)
+float  nyObDepth      = input.float(25.0, "OB: max. entry depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_NY)
+float  nyFibDepth     = input.float(50.0, "Fib: min. reclaim depth (% of range)", minval = 0, maxval = 100, step = 5, group = G_NY)
+int    nyMaxTrades    = input.int(2, "Max. trades per NY session", minval = 1, maxval = 5, group = G_NY)
+int    nyCloseH       = input.int(0, "Force-close open trades at", minval = 0, maxval = 23, group = G_NY, inline = "ncl")
+int    nyCloseM       = input.int(0, ":", minval = 0, maxval = 59, group = G_NY, inline = "ncl", tooltip = "Hour 0 = off.")
+bool   ldnLocksNY     = input.bool(false, "Earlier session TP (Asia/London/Lunch) locks NY", group = G_NY, tooltip = "On: if a London or Asia trade reached TP today, NY will not trade any more. Off: NY still trades and keeps its own daily lock.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 4a ENTRY-MODELL 1 - ORDERBLOCK RECLAIM
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useOB          = input.bool(true, "Model 1 active", group = G_OB)
+string obTriggerInput = input.string(OB_BODY, "Reclaim/entry: M5 close beyond", options = [OB_WICK, OB_BODY], group = G_OB)
+// Tiefen-Filter liegen pro Range in Gruppe 3a-3d. Der Wert hier dient nur dem Legacy-London-Modell.
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 4b ENTRY-MODELL 2 - FIB RETRACE LIMIT
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool  useFib      = input.bool(true, "Model 2 active", group = G_FIB)
+float fibLevel    = input.float(0.618, "Fib level", minval = 0.01, maxval = 0.99, step = 0.001, group = G_FIB)
+// Tiefen-Filter liegen pro Range in Gruppe 3a-3d. Der Wert hier dient nur dem Legacy-London-Modell.
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 4c ENTRY-MODELL 3 - DREI-KERZEN-ENGULFING
+// ───────────────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Modell 3 (4c): Drei-Kerzen-Engulfing AUSSERHALB der Range, Ziel = volle Gegenseite.
+// LONG:  drei bearische Kerzen unter der Range, deren Tief genommen wird, danach Close
+//        über dem höchsten Körper der drei. Limit zurück auf den Körper, SL unter die
+//        Manipulation, TP an die Range-Oberkante.
+// SHORT: spiegelverkehrt.
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool  useEng      = input.bool(false, "Model 3 master switch", group = G_ENG)
+bool  engAsia     = input.bool(true, "Asia",   group = G_ENG, inline = "eng")
+bool  engLdn      = input.bool(true, "London", group = G_ENG, inline = "eng")
+bool  engLun      = input.bool(true, "Lunch",  group = G_ENG, inline = "eng")
+bool  engNy       = input.bool(true, "NY",     group = G_ENG, inline = "eng")
+float engBodyPct  = input.float(50.0, "Candle strength: body >= % of the candle range", minval = 10, maxval = 95, step = 5, group = G_ENG, tooltip = "Body must reach this share of the candle range. Doji-like and inside candles do not count.")
+string engSeries  = input.string("Rolling - last three strong candles", "Series definition", options = ["Rolling - last three strong candles", "Exactly three candles"], group = G_ENG, tooltip = "Rolling: always the last three strong candles of a run. Exactly three: the candle before must be the opposite colour and a fourth same-direction candle discards the setup.")
+bool  engRejCancel = input.bool(true, "Cancel limit if price reaches a range edge first", group = G_ENG, tooltip = "Price must return to the limit directly. A detour to a range edge counts as rejection and deletes the limit.")
+string engRejScope = input.string("Nearest edge of any range", "Which edge counts", options = ["Nearest edge of any range", "Own range edge only"], group = G_ENG)
+bool  engNeedSweep = input.bool(true, "Low/high of the three candles must be swept first", group = G_ENG, tooltip = "On: price must run through the low/high of the three before the engulf counts.")
+float engDistPct  = input.float(100.0, "Max. distance from the range (% of range height)", minval = 10, step = 10, group = G_ENG, tooltip = "How far outside the range the setup may sit, in % of the range height.")
+string engLvlMode = input.string("Outer body of the three", "Limit level", options = ["Outer body of the three", "Body of the last of the three"], group = G_ENG, tooltip = "Outer body = the body extreme the engulf broke through (open of the first candle). Last candle = body edge of the third.")
+int   engOwnMax   = input.int(0, "Model 3: own trade budget per range (0 = share)", minval = 0, maxval = 5, group = G_ENG, tooltip = "0 = shares the range budget with the other models. 1+ = own budget per range.")
+bool  engBlocksOB = input.bool(false, "Three-candle break disables the OB entry", group = G_ENG, tooltip = "On: if the breakout out of the range consists of three strong candles, only their engulf opens a trade. Needs model 3 active.")
+bool  showEng     = input.bool(true, "Draw engulfing setups", group = G_ENG)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 4d ENTRY-MODELL 4 - FVG INVERSION
+// ───────────────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Modell 4 (4d): FVG-Inversion. Die Range bricht, der Impuls hinterlässt eine FVG
+// ausserhalb der Range. Schliesst der Preis später jenseits der gegenüberliegenden
+// Kante dieser FVG, ist sie gebrochen und dreht ihre Rolle um. Der Rücklauf auf die
+// invertierte Kante wird per Limit gehandelt, Ziel = Gegenseite der Range.
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool  useFiv      = input.bool(false, "Model 4 master switch", group = G_FIV)
+bool  fivAsia     = input.bool(true, "Asia",   group = G_FIV, inline = "fiv")
+bool  fivLdn      = input.bool(true, "London", group = G_FIV, inline = "fiv")
+bool  fivLun      = input.bool(true, "Lunch",  group = G_FIV, inline = "fiv")
+bool  fivNy       = input.bool(true, "NY",     group = G_FIV, inline = "fiv")
+bool  fivM5       = input.bool(true,  "FVG timeframe M5",  group = G_FIV, inline = "fivtf")
+bool  fivM15      = input.bool(true,  "M15", group = G_FIV, inline = "fivtf")
+bool  fivH1       = input.bool(false, "H1",  group = G_FIV, inline = "fivtf")
+bool  fivH4       = input.bool(false, "H4",  group = G_FIV, inline = "fivtf")
+int   fivBrkBars  = input.int(10, "Breakout window: max. candles", minval = 1, maxval = 60, group = G_FIV, tooltip = "Starts with the first close beyond the range edge, ends on the first close back inside or after this many candles.")
+int   fivOwnMax   = input.int(1, "Model 4: own trade budget per range (0 = share)", minval = 0, maxval = 5, group = G_FIV, tooltip = "0 = shares the range budget. 1+ = own budget per range. Each inverted FVG is used only once.")
+float fivDistPct  = input.float(100.0, "Max. distance from the range (% of range height)", minval = 10, step = 10, group = G_FIV, tooltip = "How far outside the range the inverted FVG may sit, in % of the range height.")
+bool  showFiv     = input.bool(true, "Draw FVG inversion setups", group = G_FIV)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 5  LIQUIDITAETS-FILTER (nur Modell 1)
+// ───────────────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Liquiditäts-Filter (5): drei unabhängige Zusatzbedingungen. Jeder Filter, der
+// eingeschaltet ist, muss im laufenden Manipulations-Zyklus erfüllt sein, BEVOR der
+// Reclaim-Entry gültig wird. Alle eingeschalteten Filter gelten gleichzeitig (UND).
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool  useSwingFilter = input.bool(false, "Swing sweep required", group = G_LIQ, tooltip = "Price must take out the nearest swing level on the sweep side first.")
+int   swingLen       = input.int(2, "Swing fractal length (bars each side)", minval = 1, maxval = 10, group = G_LIQ, tooltip = "2 = classic ICT fractal: a high with 2 lower highs on each side.")
+bool  showSwings     = input.bool(true, "Draw swing levels", group = G_LIQ)
+
+bool  useFvgFilter   = input.bool(false, "FVG dip required", group = G_LIQ, tooltip = "Price must dip into an unfilled FVG on the sweep side before reclaiming.")
+bool  fvgM5          = input.bool(true,  "FVG timeframe M5",  group = G_LIQ, inline = "fvgtf")
+bool  fvgM15         = input.bool(true,  "M15", group = G_LIQ, inline = "fvgtf")
+bool  fvgH1          = input.bool(false, "H1",  group = G_LIQ, inline = "fvgtf")
+bool  fvgH4          = input.bool(false, "H4",  group = G_LIQ, inline = "fvgtf")
+bool  showFvg        = input.bool(true, "Draw FVGs", group = G_LIQ)
+
+bool  useObFilter    = input.bool(false, "Orderblock tap required", group = G_LIQ, tooltip = "Price must tap the last opposite candle before a strong displacement move.")
+float obDispPct      = input.float(30.0, "OB displacement (% of range)", minval = 1.0, maxval = 500.0, step = 5, group = G_LIQ, tooltip = "Required move after the OB candle, in % of the range height.")
+int   obLookback     = input.int(20, "OB: keep last N zones", minval = 5, maxval = 50, group = G_LIQ)
+bool  showObZones    = input.bool(true, "Draw orderblocks", group = G_LIQ)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 6a STOP LOSS / TAKE PROFIT
+// ───────────────────────────────────────────────────────────────────────────────────────
+float  slBufferPct    = input.float(0.0, "SL buffer beyond the sweep extreme (% of Asia range)", minval = 0, step = 0.5, group = G_RISK)
+string tpModeInput    = input.string(TP_DUAL, "Take-profit model", options = [TP_DUAL, TP_FULL, TP_HALF, TP_CUST], group = G_RISK, tooltip = "Levels are measured from the swept side of the range. 100 % = opposite side. The Asia OB model uses its own R-based targets.")
+float  tp1LevelPct    = input.float(50.0, "Dual: TP1 level (% of range)", minval = 1, maxval = 100, step = 5, group = G_RISK, inline = "dual")
+float  tp2LevelPct    = input.float(100.0, "TP2 level (%)", minval = 1, maxval = 100, step = 5, group = G_RISK, inline = "dual")
+float  tp1SplitPct    = input.float(50.0, "Dual: share closed at TP1 (%)", minval = 1, maxval = 99, step = 5, group = G_RISK)
+float  tpCustomPct    = input.float(70.0, "Single TP Custom: level (% of range)", minval = 1, maxval = 100, step = 5, group = G_RISK)
+bool   beAfterTp1     = input.bool(true, "Dual: move SL to break-even after TP1", group = G_RISK)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 6b SESSION-SPERREN
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   shareAsiaLdn   = input.bool(false, "Asia TP locks London and vice versa", group = G_LOCK, tooltip = "On: if the first trade (Asia or London) reaches TP, the other session stops trading. After a loss the second trade is still allowed.")
+bool   prevLocksLunch = input.bool(false, "Asia/London TP locks lunch", group = G_LOCK)
+bool   flattenPrev    = input.bool(false, "New session flattens earlier sessions", group = G_LOCK, tooltip = "On: when an entry window opens, open trades and armed limits of the earlier ranges are closed and cancelled.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 6c NO-TRADE-ZONE
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useNoTrade     = input.bool(true, "Block entries at the 50 % mark", group = G_NTZ, tooltip = "If the entry price (OB close or fib limit) falls inside the zone around the range midpoint, the setup is blocked. Applies to the London, lunch and NY pre-ranges.")
+float  noTradeZone    = input.float(5.0, "Zone: 50 % +/- X % of the range", minval = 0.1, maxval = 49, step = 0.5, group = G_NTZ)
+bool   ntzAsia        = input.bool(false, "Also apply to Asia OB (midpoint of the Asia range)", group = G_NTZ)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 7a LEGACY ASIA OB
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useAsiaOB      = input.bool(false, "Legacy Asia OB model active", group = G_AOB, tooltip = "Standalone setup based on the Asia range only: sweep of the Asia high gives a short, sweep of the Asia low gives a long. The pre-range is ignored. The OB trigger (body/wick) follows model 1.")
+string legAsiaWin     = input.session("0600-1000", "Sweep & entry window", group = G_AOB)
+float  asiaSweepDist  = input.float(0.0, "Min. sweep distance (% of Asia range)", minval = 0, step = 0.5, group = G_AOB)
+float  asiaObMaxDepth = input.float(25.0, "Max. depth of entry close inside the Asia range (%)", minval = 0, maxval = 100, group = G_AOB)
+float  asiaSlBuf      = input.float(0.0, "SL buffer beyond the sweep extreme (% of Asia range)", minval = 0, step = 0.5, group = G_AOB)
+string asiaTpMode     = input.string(ATP_DUAL, "Take-profit model", options = [ATP_DUAL, ATP_SINGLE], group = G_AOB)
+float  asiaRR1        = input.float(1.0, "TP1 (R)", minval = 0.1, step = 0.1, group = G_AOB, inline = "arr")
+float  asiaRR2        = input.float(2.0, "TP2 / target (R)", minval = 0.1, step = 0.1, group = G_AOB, inline = "arr")
+bool   asiaBE         = input.bool(true, "Dual: move SL to break-even after TP1", group = G_AOB)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 7b LEGACY LONDON
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool   useLegLdn  = input.bool(false, "Legacy London model active", group = G_LOC, tooltip = "The original London setup: the pre-range must sit at an Asia edge, and a double sweep is required. Off by default; the standalone London range in group 2b replaces it.")
+int    cutoffHour    = input.int(10, "Legacy London: no new trades from", minval = 0, maxval = 23, group = G_LOC, inline = "cut")
+int    cutoffMinute  = input.int(0, ":", minval = 0, maxval = 59, group = G_LOC, inline = "cut")
+
+float  legAsiaSwDist = input.float(0.0, "Legacy London: min. Asia sweep distance (%)", minval = 0, step = 0.5, group = G_LOC)
+float  obMaxDepth  = input.float(25.0, "Legacy London: OB max. entry depth (%)", minval = 0, maxval = 100, step = 5, group = G_LOC)
+float  fibMinDepth = input.float(50.0, "Legacy London: fib min. reclaim depth (%)", minval = 0, maxval = 100, step = 5, group = G_LOC)
+
+float locShortMin = input.float(80.0,  "SHORT: pre-mid from %", group = G_LOC, inline = "ls")
+float locShortMax = input.float(130.0, "to %",                  group = G_LOC, inline = "ls")
+float locLongMin  = input.float(-30.0, "LONG: pre-mid from %",  group = G_LOC, inline = "ll")
+float locLongMax  = input.float(20.0,  "to %",                  group = G_LOC, inline = "ll", tooltip = "Position of the pre-range midpoint as % of the Asia range. 0 % = Asia low, 100 % = Asia high, below 0 or above 100 = outside.")
+float locMaxGap   = input.float(10.0,  "Max. gap pre-edge to Asia edge (% of Asia range)", minval = 0, group = G_LOC, tooltip = "If the pre-range sits outside the Asia range, its nearest edge may be at most this far from the Asia edge.")
+
+string doubleSweepInput = input.string(DS_REQ, "Legacy London: double sweep (Asia + Pre)", options = [DS_REQ, DS_OPT], group = G_LOC, tooltip = "Legacy London only. The Asia sweep may happen any time after the Asia range ends (including during the pre-range). The pre sweep only counts after the pre-range ends.")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 8  VISUALS
+// ───────────────────────────────────────────────────────────────────────────────────────
+bool showAsia     = input.bool(true, "Asia box",                 group = G_VIS)
+bool showPre      = input.bool(true, "Pre-range box",            group = G_VIS)
+bool showPreLines = input.bool(true, "Pre-range lines + 0.5",   group = G_VIS)
+bool showSweep    = input.bool(true, "Sweep labels",             group = G_VIS)
+bool showReclaim  = input.bool(true, "Reclaim labels",           group = G_VIS)
+bool showOB       = input.bool(true, "Orderblock",               group = G_VIS)
+bool showFib      = input.bool(true, "Fib limit",                group = G_VIS)
+bool showEntry    = input.bool(true, "Entry labels",             group = G_VIS)
+bool showTrades   = input.bool(true, "SL / TP boxes + target",   group = G_VIS)
+bool showResults  = input.bool(true, "Trade result labels",    group = G_VIS)
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 9  FARBEN
+// ───────────────────────────────────────────────────────────────────────────────────────
+color colAsiaFill = input.color(color.new(#e91e63, 88), "Asia box",       group = G_COL, inline = "c1")
+color colAsiaLine = input.color(color.new(#e91e63, 40), "Border",           group = G_COL, inline = "c1")
+color colPreFill  = input.color(color.new(#00bcd4, 82), "Pre box",        group = G_COL, inline = "c2")
+color colPreLine  = input.color(color.new(#00bcd4, 30), "Border",           group = G_COL, inline = "c2")
+color colLunchFill = input.color(color.new(#1de9b6, 85), "Lunch box",   group = G_COL, inline = "c2b")
+color colLunchLine = input.color(color.new(#1de9b6, 30), "Border",        group = G_COL, inline = "c2b")
+color colNyFill    = input.color(color.new(#ffab00, 85), "NY box",      group = G_COL, inline = "c2c")
+color colNyLine    = input.color(color.new(#ffab00, 30), "Border",        group = G_COL, inline = "c2c")
+color colLines    = input.color(color.new(#b2b5be, 40), "Pre lines",     group = G_COL)
+color colBull     = input.color(#089981, "Long",                          group = G_COL, inline = "c3")
+color colBear     = input.color(#f23645, "Short",                         group = G_COL, inline = "c3")
+color colSweep    = input.color(#ff9800, "Sweep",                         group = G_COL, inline = "c4")
+color colReclaim  = input.color(#2962ff, "Reclaim",                       group = G_COL, inline = "c4")
+color colOB       = input.color(color.new(#9c27b0, 75), "Orderblock",     group = G_COL, inline = "c5")
+color colAsiaOB   = input.color(color.new(#ff5252, 75), "Asia OB",       group = G_COL, inline = "c5b")
+color colFib      = input.color(#ffeb3b, "Fib limit",                     group = G_COL, inline = "c5")
+color colRisk     = input.color(color.new(#f23645, 80), "SL zone",        group = G_COL, inline = "c6")
+color colReward   = input.color(color.new(#089981, 80), "TP zone",        group = G_COL, inline = "c6")
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// 10 DEBUG
+// ───────────────────────────────────────────────────────────────────────────────────────
+string dbgMode      = input.string("Compact", "Debug panel", options = ["Compact", "Off"], group = G_DBG)
+bool   showDebug    = dbgMode != "Off"
+bool   showDebugLbl = input.bool(false, "Debug labels on chart (location, invalidation)", group = G_DBG)
+string dbgPosInput  = input.string(position.top_right, "Panel position", options = [position.top_right, position.bottom_right, position.top_left, position.bottom_left], group = G_DBG)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 2. DATENTYPEN
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Liquiditäts-Objekte: Swing-Levels, FVGs und Orderblocks
+type Lvl
+    float px
+    int   t
+    bool  active = true
+
+type Zone
+    float bot
+    float top
+    int   dir        = 0        // 1 = bullish (unter der Range), -1 = bearish (über der Range)
+    int   t          = 0
+    float move       = 0.0      // nur OB: bisher erreichte Impulsgröße in Preis
+    float anchor     = na       // nur OB: Startpunkt des Impulses (Low bzw. High der OB-Kerze)
+    bool  dead       = false
+    bool  inv        = false     // durch Close jenseits der Gegenkante gebrochen
+    bool  used       = false     // schon einmal für einen Trade verwendet
+    int   invT       = 0
+    int   seen       = 0         // Chart-Zeit, zu der die FVG registriert wurde
+    string tf        = ""
+
+// Session-Zeitstempel eines Tages (UNIX ms, bereits in der gewählten Zeitzone aufgelöst)
+type SessionTimes
+    int asiaStart
+    int asiaEnd
+    int preStart
+    int preEnd
+    int cutoff
+    int asiaWinStart
+    int asiaWinEnd
+    int nyPreStart
+    int nyPreEnd
+    int nyEntryStart
+    int nyEntryEnd
+    int ldnFibEnd
+    int nyFibEnd
+    int lunchPreStart
+    int lunchPreEnd
+    int lunchEntryStart
+    int lunchEntryEnd
+    int lunchFibEnd
+    int asiaEntryStart
+    int asiaEntryEnd
+    int asiaFibEnd
+    int ldnEntryStart
+    int ldnEntryEnd
+    int asiaCloseT
+    int ldnCloseT
+    int lunchCloseT
+    int nyCloseT
+
+// Wiederverwendbares Range-Objekt (später z.B. NY Pre-Range)
+type RangeObj
+    float hi       = na
+    float lo       = na
+    int   bars     = 0
+    bool  complete = false
+    box   bx       = na
+    label lblHi    = na
+    label lblLo    = na
+
+// Trade-Zähler je Session
+type Counter
+    int n = 0
+
+// Tagesweite Sperren je Session (Strategie)
+type DayState
+    int  slN       = 0
+    int  tpN       = 0
+    bool lockAsia  = false
+    bool lockLdn   = false
+    bool lockLunch = false
+    bool lockNy    = false
+
+// Setup-Zustand eines Tages (eine Instanz pro Setup-Typ / Tag)
+type Setup
+    int    state        = 0
+    int    dir          = 0        // 1 = LONG, -1 = SHORT, 0 = keine
+    float  locPos       = na
+    float  locGap       = na
+    string reason       = ""
+    int    trades       = 0
+    int    invalidations = 0
+    int    sigTime      = na       // M5-Bar-Zeit des letzten Entry-Signals
+    int    sigDir       = 0
+    // --- Manipulations-Zyklus (wird nach Entry / Invalidierung neu gestartet) ---
+    int    cycStart     = na
+    float  cycMaxAll    = na
+    int    cycMaxAllT   = na
+    float  cycMinAll    = na
+    int    cycMinAllT   = na
+    float  cycMaxPost   = na
+    int    cycMaxPostT  = na
+    float  cycMinPost   = na
+    int    cycMinPostT  = na
+    bool   asiaSwept    = false
+    bool   preSwept     = false
+    float  sweepExt     = na
+    int    sweepExtT    = na
+    label  sweepLbl     = na
+    // --- Orderblock ---
+    bool   obValid      = false
+    float  obHi         = na
+    float  obLo         = na
+    float  obBodyHi     = na
+    float  obBodyLo     = na
+    int    obTime       = na
+    box    obBox        = na
+    // --- Reclaim / Fib ---
+    int    reclaimTime  = na
+    float  reclaimDepth = na
+    float  recExt       = na
+    bool   recFixed     = false
+    bool   fibArmed     = false
+    float  fibLimit     = na
+    int    fibArmTime   = na
+    line   fibLine      = na
+    string fibOrderId   = na
+    float  fibQty       = na
+    // --- Session-Parameter (London / NY nutzen dieselbe State Machine) ---
+    string tag          = "PRE"
+    bool   isNY         = false
+    int    preEndT      = na
+    int    entryStartT  = na
+    int    entryEndT    = na
+    int    maxTrades    = 2
+    // Modell 3: Drei-Kerzen-Engulfing
+    Counter engCnt      = na       // Trade-Zähler für Modell 3 (eigener oder der Range-Zähler)
+    bool   trioValid    = false
+    bool   sweepTrio    = false     // Ausbruch aus der Range bestand aus drei starken Kerzen
+    int    trioAge      = 0
+    bool   trioSwept    = false
+    float  trioLo       = na       // gemeinsames Extrem der drei Kerzen
+    float  trioTrig     = na       // höchster/tiefster Körper der drei = Auslöselevel
+    float  trioLimit    = na       // Level für die Limit-Order
+    float  trioExt      = na       // Manipulations-Extrem nach den drei Kerzen
+    int    trioT        = 0
+    bool   engArmed     = false
+    float  engLimit     = na
+    float  engSL        = na
+    float  engTP        = na
+    float  engTP2       = na
+    float  engRej       = na       // Kante, deren Berührung das Limit ungültig macht
+    // Modell 4: FVG-Inversion
+    bool   fivArmed     = false
+    float  fivLimit     = na
+    float  fivSL        = na
+    float  fivTP        = na
+    float  fivTP2       = na
+    bool   fivDual      = false
+    float  fivQty       = na
+    string fivOrderId   = na
+    line   fivLine      = na
+    Zone   fivZone      = na
+    bool   brkOpen      = false    // Ausbruchs-Fenster dieser Richtung läuft
+    int    brkFrom      = 0
+    int    brkTo        = 0
+    int    brkBars      = 0
+    Counter fivCnt      = na
+    bool   engDual      = false
+    float  engQty       = na
+    string engOrderId   = na
+    line   engLine      = na
+    box    engBox       = na
+    // Liquiditäts-Filter, pro Zyklus
+    bool   liqSwept     = false      // nächstes Swing-Level auf der Sweep-Seite genommen
+    float  liqLvl       = na         // welches Level das ist
+    bool   fvgTapped    = false      // in einen ungefüllten FVG gelaufen
+    bool   obTapped     = false      // in einen Orderblock gelaufen
+    float  swDistPct    = 0.0        // min. sweep distance of this setup's own range, in %
+    float  obDepthPct   = 25.0       // OB: max. entry depth into the range, in %
+    float  fibDepthPct  = 50.0       // Fib: min. reclaim depth into the range, in %
+    string grp          = "LDN"
+    Counter cnt         = na          // je Session eigener Zähler (wird beim Tagesreset gesetzt)
+    int    fibEndT      = na
+    bool   fibEligible  = false     // Reclaim-Close ≥ Fib-Schwelle
+
+// Trade (Dual-TP = 1 Trade mit 2 Zielen)
+type Trade
+    int    dir
+    string model
+    float  entry
+    float  sl
+    float  tp1
+    float  tp2
+    bool   dual
+    int    entryTime
+    int    checkFrom
+    string id        = ""
+    float  qty       = na
+    string grp       = "LDN"
+    int    closeT    = na            // force-close time, na = off
+    bool   tp1Hit    = false
+    bool   beActive  = false
+    bool   beOnTp1   = false
+    string tp1Txt    = "TP1"
+    string tp2Txt    = "TP2"
+    box    riskBox   = na
+    box    rewardBox = na
+    line   tp1Line   = na
+
+// Asia-OB-Setup (eine Instanz pro Richtung)
+type AsiaSetup
+    int    dir
+    int    state         = 0
+    string reason        = "Waiting for Asia range"
+    int    invalidations = 0
+    int    sigTime       = na
+    int    cycStart      = na
+    float  ext           = na
+    int    extT          = na
+    bool   swept         = false
+    label  sweepLbl      = na
+    bool   obValid       = false
+    float  obHi          = na
+    float  obLo          = na
+    float  obBodyHi      = na
+    float  obBodyLo      = na
+    int    obTime        = na
+    box    obBox         = na
+
+// Order-Auftrag: Funktionen sammeln nur, ausgeführt wird im globalen Scope (Abschnitt 11b).
+// Grund: strategy.*-Aufrufe aus verschachtelten Funktionen werden von Pine nicht zuverlässig
+// an die Broker-Emulation übergeben → Strategietester meldet "requires trade data".
+type OrderReq
+    string kind    = ""
+    string id      = ""
+    int    dir     = 0
+    float  qty     = na
+    float  price   = na
+    float  sl      = na
+    float  tp1     = na
+    float  tp2     = na
+    bool   dual    = false
+    string comment = ""
+
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Globale Objekte – vor den Funktionen deklariert, damit diese darauf zugreifen können
+// ───────────────────────────────────────────────────────────────────────────────────────
+var array<Lvl>  swHi  = array.new<Lvl>()
+var array<Lvl>  swLo  = array.new<Lvl>()
+var array<Zone> fvgs  = array.new<Zone>()
+var array<Zone> obz   = array.new<Zone>()
+
+// Die vier Ranges stehen hier, damit auch die Funktionen sie auswerten können
+var RangeObj     asiaR      = RangeObj.new()
+var RangeObj     preR       = RangeObj.new()
+var RangeObj     nyPreR     = RangeObj.new()
+var RangeObj     lunchR     = RangeObj.new()
+var array<Trade> openTrades = array.new<Trade>()
+var Setup        setup      = Setup.new()
+var Counter      tradeSeq   = Counter.new()
+var DayState     dayState   = DayState.new()
+var array<OrderReq> orderQ  = array.new<OrderReq>()
+// Diagnose-Zähler: [0] in Queue gelegt, [1] davon Entries/Limits, [2] ausgeführt
+// Array statt int, weil Pine-Funktionen globale Skalare nicht beschreiben dürfen.
+var array<int> qStat = array.new<int>(3, 0)
+var array<int> sessCloseT = array.new<int>(4, 0)   // [ASIA, LDN, LUNCH, NY] force-close times
+var array<bool> flushDone = array.new<bool>(3, false)  // Session-Flush je Fenster nur einmal
+var array<float> qLast = array.new<float>(1, na)   // zuletzt übergebene Ordergröße
+var array<string> engMsg = array.new<string>(1, "-")   // letzte Meldung von Modell 3
+
+f_q(string kind, string id, int dir, float qty, float price, float sl, float tp1, float tp2, bool dual, string cmt) =>
+    orderQ.push(OrderReq.new(kind, id, dir, qty, price, sl, tp1, tp2, dual, cmt))
+    qStat.set(0, qStat.get(0) + 1)
+    if kind == "entry" or kind == "limit"
+        qStat.set(1, qStat.get(1) + 1)
+        qLast.set(0, qty)
+    true
+var Counter      ldnCnt     = Counter.new()
+var Counter      nyCnt      = Counter.new()
+var Counter      lunchCnt   = Counter.new()
+var Counter      fivACnt    = Counter.new()
+var Counter      fivLCnt    = Counter.new()
+var Counter      fivLuCnt   = Counter.new()
+var Counter      fivNCnt    = Counter.new()
+var Counter      engACnt    = Counter.new()
+var Counter      engLCnt    = Counter.new()
+var Counter      engLuCnt   = Counter.new()
+var Counter      engNCnt    = Counter.new()
+var Setup        asiaS      = Setup.new(dir = -1, tag = "ASIA",  isNY = true, grp = "ASIA")
+var Setup        asiaL      = Setup.new(dir = 1,  tag = "ASIA",  isNY = true, grp = "ASIA")
+var Setup        ldnS       = Setup.new(dir = -1, tag = "LONDON", isNY = true, grp = "LDN")
+var Setup        ldnL       = Setup.new(dir = 1,  tag = "LONDON", isNY = true, grp = "LDN")
+var Setup        nyShort    = Setup.new(dir = -1, tag = "NY", isNY = true, grp = "NY")
+var Setup        nyLong     = Setup.new(dir = 1,  tag = "NY", isNY = true, grp = "NY")
+var Setup        lunchShort = Setup.new(dir = -1, tag = "LUNCH", isNY = true, grp = "LUNCH")
+var Setup        lunchLong  = Setup.new(dir = 1,  tag = "LUNCH", isNY = true, grp = "LUNCH")
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 3. HILFSFUNKTIONEN
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_max(float a, float b) =>
+    na(a) ? b : math.max(a, b)
+
+f_min(float a, float b) =>
+    na(a) ? b : math.min(a, b)
+
+f_px(float v) =>
+    na(v) ? "–" : str.tostring(v, format.mintick)
+
+f_pct(float v) =>
+    na(v) ? "–" : str.tostring(v, "#.#") + " %"
+
+f_stateName(int st) =>
+    switch st
+        ST_IDLE         => "0 IDLE"
+        ST_BUILD_ASIA   => "1 BUILD ASIA"
+        ST_BUILD_PRE    => "2 BUILD PRE"
+        ST_WAIT_SWEEP   => "3 WAIT SWEEP"
+        ST_WAIT_RECLAIM => "4 WAIT RECLAIM"
+        ST_WAIT_ENTRY   => "5 WAIT ENTRY"
+        ST_CUTOFF       => "6 CUTOFF"
+        ST_MAX_TRADES   => "7 MAX TRADES"
+        ST_INVALID_LOC  => "8 INVALID LOCATION"
+        ST_NO_DATA      => "9 NO DATA"
+        => "?"
+
+f_asiaStateName(int st) =>
+    switch st
+        AS_WAIT_RANGE   => "WAIT RANGE"
+        AS_WAIT_SWEEP   => "WAIT SWEEP"
+        AS_WAIT_RECLAIM => "WAIT OB RECLAIM"
+        AS_CUTOFF       => "WINDOW END"
+        AS_MAX_TRADES   => "MAX TRADES"
+        => "?"
+
+// Tiefe eines Preises in der Pre-Range, gemessen von der gesweepten Seite (0 % = Kante)
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Liquiditäts-Filter: Helfer
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Nächstes noch unberührtes Swing-Level auf der Sweep-Seite der Range.
+// LONG (d = 1) sweept das Range-Low → gesucht ist das höchste Swing-Low UNTER pre.lo.
+// SHORT (d = -1) sweept das Range-High → gesucht ist das tiefste Swing-High ÜBER pre.hi.
+f_nearestLvl(int d, RangeObj pre) =>
+    float best = na
+    if d == 1
+        for lv in swLo
+            if lv.active and lv.px < pre.lo and (na(best) or lv.px > best)
+                best := lv.px
+    else
+        for lv in swHi
+            if lv.active and lv.px > pre.hi and (na(best) or lv.px < best)
+                best := lv.px
+    best
+
+// Läuft der Preis in eine Zone auf der Sweep-Seite? minMove > 0 = zusätzliche
+// Displacement-Bedingung (nur Orderblocks).
+f_zoneTap(array<Zone> zones, int d, RangeObj pre, float h, float l, float minMove, int t, bool draw, color col, string txt) =>
+    bool hit = false
+    for z in zones
+        if not z.dead and z.dir == d and z.move >= minMove
+            bool onSide = d == 1 ? z.top <= pre.lo : z.bot >= pre.hi
+            if onSide and l <= z.top and h >= z.bot and not hit
+                hit := true
+                if draw
+                    box.new(z.t, z.top, t, z.bot, xloc = xloc.bar_time, border_color = col, bgcolor = color.new(col, 80))
+                    label.new(t, z.bot, txt + (z.tf != "" ? " " + z.tf : ""), xloc = xloc.bar_time, style = label.style_label_up, color = color.new(color.black, 100), textcolor = col, size = size.tiny)
+    hit
+
+// Alle eingeschalteten Filter erfüllt?
+f_liqOK(Setup s) =>
+    (not useSwingFilter or s.liqSwept) and (not useFvgFilter or s.fvgTapped) and (not useObFilter or s.obTapped)
+
+f_liqReason(Setup s) =>
+    useSwingFilter and not s.liqSwept ? "swing level not swept" : useFvgFilter and not s.fvgTapped ? "no FVG dip" : "no orderblock tap"
+
+f_depth(int d, RangeObj pre, float price) =>
+    float r = pre.hi - pre.lo
+    r > 0 and not na(price) ? (d == -1 ? pre.hi - price : price - pre.lo) / r * 100.0 : na
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 4. SESSIONS / ZEITZONE
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_parseSession(string s) =>
+    int sh = int(str.tonumber(str.substring(s, 0, 2)))
+    int sm = int(str.tonumber(str.substring(s, 2, 4)))
+    int eh = int(str.tonumber(str.substring(s, 5, 7)))
+    int em = int(str.tonumber(str.substring(s, 7, 9)))
+    [sh, sm, eh, em]
+
+// timestamp() mit IANA-Zeitzone → Wanduhrzeit bleibt über DST-Wechsel korrekt
+f_buildSessionTimes(int barTime) =>
+    int y  = year(barTime, tzInput)
+    int mo = month(barTime, tzInput)
+    int d  = dayofmonth(barTime, tzInput)
+    [ash, asm, aeh, aem] = f_parseSession(asiaSessInput)
+    [psh, psm, peh, pem] = f_parseSession(preSessInput)
+    [wsh, wsm, weh, wem] = f_parseSession(legAsiaWin)
+    [aeh2, aem2, aeh3, aem3] = f_parseSession(asiaWinInput)
+    [beh, bem, beh2, bem2]   = f_parseSession(ldnEntryInput)
+    [nsh, nsm, neh, nem] = f_parseSession(nyPreSessInput)
+    [xsh, xsm, xeh, xem] = f_parseSession(nyEntrySessInput)
+    [lsh, lsm, leh, lem] = f_parseSession(lunchSessInput)
+    [ysh, ysm, yeh, yem] = f_parseSession(lunchEntryInput)
+    SessionTimes.new(timestamp(tzInput, y, mo, d, ash, asm, 0), timestamp(tzInput, y, mo, d, aeh, aem, 0), timestamp(tzInput, y, mo, d, psh, psm, 0), timestamp(tzInput, y, mo, d, peh, pem, 0), timestamp(tzInput, y, mo, d, cutoffHour, cutoffMinute, 0), timestamp(tzInput, y, mo, d, wsh, wsm, 0), timestamp(tzInput, y, mo, d, weh, wem, 0), timestamp(tzInput, y, mo, d, nsh, nsm, 0), timestamp(tzInput, y, mo, d, neh, nem, 0), timestamp(tzInput, y, mo, d, xsh, xsm, 0), timestamp(tzInput, y, mo, d, xeh, xem, 0), timestamp(tzInput, y, mo, d, ldnFibEndH, ldnFibEndM, 0), timestamp(tzInput, y, mo, d, nyFibEndH, nyFibEndM, 0), timestamp(tzInput, y, mo, d, lsh, lsm, 0), timestamp(tzInput, y, mo, d, leh, lem, 0), timestamp(tzInput, y, mo, d, ysh, ysm, 0), timestamp(tzInput, y, mo, d, yeh, yem, 0), timestamp(tzInput, y, mo, d, lunchFibEndH, lunchFibEndM, 0), timestamp(tzInput, y, mo, d, aeh2, aem2, 0), timestamp(tzInput, y, mo, d, aeh3, aem3, 0), timestamp(tzInput, y, mo, d, asiaFibEndH, asiaFibEndM, 0), timestamp(tzInput, y, mo, d, beh, bem, 0), timestamp(tzInput, y, mo, d, beh2, bem2, 0), asiaCloseH > 0 ? timestamp(tzInput, y, mo, d, asiaCloseH, asiaCloseM, 0) : 0, ldnCloseH > 0 ? timestamp(tzInput, y, mo, d, ldnCloseH, ldnCloseM, 0) : 0, lunchCloseH > 0 ? timestamp(tzInput, y, mo, d, lunchCloseH, lunchCloseM, 0) : 0, nyCloseH > 0 ? timestamp(tzInput, y, mo, d, nyCloseH, nyCloseM, 0) : 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 5. RANGES (Berechnung + Zeichnung)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+method update(RangeObj r, float h, float l) =>
+    r.hi   := f_max(r.hi, h)
+    r.lo   := f_min(r.lo, l)
+    r.bars := r.bars + 1
+
+f_drawRange(RangeObj r, int left, int right, int lineEnd, color fillCol, color borderCol, string name, bool withLines) =>
+    if r.bars > 0
+        if na(r.bx)
+            r.bx := box.new(left, r.hi, right, r.lo, xloc = xloc.bar_time, bgcolor = fillCol, border_color = borderCol)
+        else
+            r.bx.set_top(r.hi)
+            r.bx.set_bottom(r.lo)
+        if r.complete and na(r.lblHi)
+            int lblX = withLines ? lineEnd : right
+            if withLines
+                float mid = (r.hi + r.lo) / 2.0
+                line.new(left, r.hi, lineEnd, r.hi, xloc = xloc.bar_time, color = colLines)
+                line.new(left, mid,  lineEnd, mid,  xloc = xloc.bar_time, color = colLines, style = line.style_dotted)
+                line.new(left, r.lo, lineEnd, r.lo, xloc = xloc.bar_time, color = colLines)
+                label.new(lineEnd, mid, "0.5", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.black, 100), textcolor = colLines, size = size.tiny)
+            r.lblHi := label.new(lblX, r.hi, name + " HIGH", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.black, 100), textcolor = borderCol, size = size.tiny)
+            r.lblLo := label.new(lblX, r.lo, name + " LOW",  xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.black, 100), textcolor = borderCol, size = size.tiny)
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 6. LOCATION-VALIDIERUNG
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Rückgabe: [Richtung, Position der Pre-Mitte in % Asia Range, Abstand in % Asia Range]
+f_validateLocation(RangeObj asia, RangeObj pre) =>
+    float rA  = asia.hi - asia.lo
+    int   dir = 0
+    float pos = na
+    float gap = na
+    if rA > 0
+        float mid   = (pre.hi + pre.lo) / 2.0
+        pos        := (mid - asia.lo) / rA * 100.0
+        float gapS  = math.max(0.0, pre.lo - asia.hi) / rA * 100.0
+        float gapL  = math.max(0.0, asia.lo - pre.hi) / rA * 100.0
+        bool coversBoth = pre.hi >= asia.hi and pre.lo <= asia.lo           // A2: beide Extreme → kein Setup
+        bool isShort = pos >= locShortMin and pos <= locShortMax and gapS <= locMaxGap
+        bool isLong  = pos >= locLongMin  and pos <= locLongMax  and gapL <= locMaxGap
+        dir := coversBoth or (isShort and isLong) ? 0 : isShort ? -1 : isLong ? 1 : 0
+        gap := pos >= 50 ? gapS : gapL
+    [dir, pos, gap]
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 7. ZYKLUS / INVALIDIERUNG (getrennt von der Entry-Logik)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_cancelFib(Setup s, int t) =>
+    if s.fibArmed and not na(s.fibLine)
+        s.fibLine.set_x2(t)
+    if s.fibArmed and not na(s.fibOrderId)
+        f_q("cancel", s.fibOrderId, 0, na, na, na, na, na, false, "")
+    s.fibOrderId := na
+    s.fibArmed   := false
+    true
+
+// Startet einen neuen Manipulations-Zyklus: neuer Sweep ist ab startT erforderlich
+method resetCycle(Setup this, int startT) =>
+    if not na(this.obBox)
+        this.obBox.set_right(startT)
+    this.cycStart     := startT
+    this.cycMaxAll    := na
+    this.cycMaxAllT   := na
+    this.cycMinAll    := na
+    this.cycMinAllT   := na
+    this.cycMaxPost   := na
+    this.cycMaxPostT  := na
+    this.cycMinPost   := na
+    this.cycMinPostT  := na
+    this.fivArmed     := false
+    this.fivLimit     := na
+    this.fivOrderId   := na
+    this.sweepTrio    := false
+    this.liqSwept     := false
+    this.liqLvl       := na
+    this.fvgTapped    := false
+    this.obTapped     := false
+    this.asiaSwept    := false
+    this.preSwept     := false
+    this.sweepExt     := na
+    this.sweepExtT    := na
+    this.sweepLbl     := na
+    this.obValid      := false
+    this.obHi         := na
+    this.obLo         := na
+    this.obBodyHi     := na
+    this.obBodyLo     := na
+    this.obTime       := na
+    this.obBox        := na
+    this.reclaimTime  := na
+    this.reclaimDepth := na
+    this.recExt       := na
+    this.recFixed     := false
+    this.fibArmed     := false
+    this.fibLimit     := na
+    this.fibArmTime   := na
+    this.fibLine      := na
+    this.fibEligible  := false
+
+// Gegenseite der Pre-Range vor Entry erreicht → Zyklus ungültig, Refresh durch neue Manipulation
+f_invalidate(Setup s, RangeObj pre, int t, string why) =>
+    f_cancelFib(s, t)
+    s.resetCycle(t + 60000)
+    s.state         := ST_WAIT_SWEEP
+    s.invalidations := s.invalidations + 1
+    s.reason        := why + " - waiting for a new manipulation"
+    if showDebugLbl
+        label.new(t, s.dir == -1 ? pre.lo : pre.hi, "INVALID", xloc = xloc.bar_time, style = s.dir == -1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 7b. STRATEGIE-HELFER (Positionsgröße, Order-IDs, Sperren, Exits)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_calcQty(float entry, float sl) =>
+    float pv        = na(syminfo.pointvalue) or syminfo.pointvalue <= 0 ? 1.0 : syminfo.pointvalue
+    float perUnit   = math.abs(entry - sl) * pv
+    float riskMoney = strategy.equity * riskPct / 100.0
+    float q         = perUnit > 0 ? math.floor(riskMoney / perUnit / lotStep) * lotStep : na
+    fixedQty > 0 ? fixedQty : (na(q) or q <= 0 ? na : q)
+
+f_newId(string model, int d) =>
+    tradeSeq.n := tradeSeq.n + 1
+    model + (d == 1 ? " L" : " S") + " #" + str.tostring(tradeSeq.n)
+
+// Keine Gegenpositionen + Tages-Sperre nach TP
+// Entry-Preis in der No-Trade-Zone um die Range-Mitte?
+f_inNoTradeZone(RangeObj r, float price) =>
+    float rng = r.hi - r.lo
+    bool res = false
+    if useNoTrade and rng > 0 and not na(price)
+        float posPct = (price - r.lo) / rng * 100.0
+        res := math.abs(posPct - 50.0) <= noTradeZone
+    res
+
+// Zeit-Exit der Session, 0 = aus
+f_closeTime(string grp) =>
+    grp == "ASIA" ? sessCloseT.get(0) : grp == "LDN" ? sessCloseT.get(1) : grp == "LUNCH" ? sessCloseT.get(2) : sessCloseT.get(3)
+
+f_isLocked(string grp) =>
+    switch grp
+        "ASIA"  => dayState.lockAsia  or (shareAsiaLdn and dayState.lockLdn)
+        "LDN"   => dayState.lockLdn   or (shareAsiaLdn and dayState.lockAsia)
+        "LUNCH" => dayState.lockLunch or (prevLocksLunch and (dayState.lockAsia or dayState.lockLdn))
+        "NY"    => dayState.lockNy    or (ldnLocksNY and (dayState.lockAsia or dayState.lockLdn or dayState.lockLunch))
+        => false
+
+f_setLock(string grp) =>
+    if grp == "ASIA"
+        dayState.lockAsia := true
+    else if grp == "LDN"
+        dayState.lockLdn := true
+    else if grp == "LUNCH"
+        dayState.lockLunch := true
+    else if grp == "NY"
+        dayState.lockNy := true
+    true
+
+// Tagesergebnis verbuchen: nach X Stops oder einem vollen Ziel ist der Tag zu Ende
+f_dayResult(string res) =>
+    if res == "SL"
+        dayState.slN := dayState.slN + 1
+    if res == "TP2 ✓" or res == "TP ✓"
+        dayState.tpN := dayState.tpN + 1
+    if (dayMaxSL > 0 and dayState.slN >= dayMaxSL) or (dayStopTP and dayState.tpN >= 1)
+        dayState.lockAsia  := true
+        dayState.lockLdn   := true
+        dayState.lockLunch := true
+        dayState.lockNy    := true
+    true
+
+f_allowed(int d, string grp) =>
+    bool opp = false
+    for tr in openTrades
+        if tr.dir == -d
+            opp := true
+    bool tvOpp = d == 1 ? strategy.position_size < 0 : strategy.position_size > 0
+    not f_isLocked(grp) and (allowCounter or (not opp and not tvOpp))
+
+f_blockReason(string grp) =>
+    f_isLocked(grp) ? "TP reached in this or an earlier session - locked" : "Opposite position open"
+
+f_tp1Qty(float q) =>
+    math.floor(q * tp1SplitPct / 100.0 / lotStep) * lotStep
+
+// Exit-Orders: Dual = 50 % TP1 / Rest TP2, Single = 100 % TP
+f_placeExits(string id, bool dual, float q, float tp1, float tp2, float sl) =>
+    f_q("exits", id, 0, q, na, sl, tp1, tp2, dual, "")
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 8. TRADE-MANAGEMENT (SL / TP1 / BE / TP2 – Reihenfolge per M1)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_closeTrade(Trade tr, int t, float px, string res) =>
+    f_dayResult(res)
+    if not na(tr.riskBox)
+        tr.riskBox.set_right(t)
+    if not na(tr.rewardBox)
+        tr.rewardBox.set_right(t)
+    if not na(tr.tp1Line)
+        tr.tp1Line.set_x2(t)
+    if showResults
+        color c = res == "SL" ? colBear : res == "BE" or res == "TIME EXIT" ? color.gray : res == "TP1 ✓ / SL" ? colSweep : colBull
+        label.new(t, px, res, xloc = xloc.bar_time, style = label.style_label_left, color = color.new(c, 15), textcolor = color.white, size = size.small)
+    true
+
+f_manageTrades(array<Trade> trades, int t, float h, float l, float c) =>
+    int n = trades.size()
+    if n > 0
+        for i = n - 1 to 0
+            Trade tr = trades.get(i)
+            if t >= tr.checkFrom and not na(tr.closeT) and tr.closeT > 0 and t >= tr.closeT
+                // Zeit-Exit: offener Trade dieser Session wird zum Marktpreis geschlossen
+                f_q("close", tr.id, 0, na, na, na, na, na, false, "time exit")
+                f_closeTrade(tr, t, c, "TIME EXIT")
+                trades.remove(i)
+            else if t >= tr.checkFrom
+                bool isShort  = tr.dir == -1
+                bool slHit    = isShort ? h >= tr.sl  : l <= tr.sl
+                bool tp1Touch = isShort ? l <= tr.tp1 : h >= tr.tp1
+                bool tp2Touch = isShort ? l <= tr.tp2 : h >= tr.tp2
+                if slHit    // SL und TP in derselben M1-Kerze → konservativ SL
+                    f_closeTrade(tr, t, tr.sl, not tr.tp1Hit ? "SL" : tr.beActive ? "BE" : "TP1 ✓ / SL")
+                    trades.remove(i)
+                else if not tr.dual
+                    if tp1Touch
+                        f_closeTrade(tr, t, tr.tp1, "TP ✓")
+                        trades.remove(i)
+                        if lockMode != LOCK_OFF
+                            f_setLock(tr.grp)
+                else
+                    if not tr.tp1Hit and tp1Touch
+                        tr.tp1Hit := true
+                        if lockMode == LOCK_FIRST
+                            f_setLock(tr.grp)
+                        if tr.beOnTp1
+                            tr.sl       := tr.entry
+                            tr.beActive := true
+                            float q1 = f_tp1Qty(tr.qty)
+                            f_q("be", tr.id, 0, q1 > 0 ? tr.qty - q1 : tr.qty, na, tr.entry, na, tr.tp2, false, "")
+                        if showResults
+                            label.new(t, tr.tp1, "TP1 ✓", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(colBull, 30), textcolor = color.white, size = size.tiny)
+                    if tr.tp1Hit and tp2Touch
+                        f_closeTrade(tr, t, tr.tp2, "TP2 ✓")
+                        trades.remove(i)
+                        if lockMode != LOCK_OFF
+                            f_setLock(tr.grp)
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 9. ENTRY / TARGET
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Gemeinsame Zeichnung für alle Modelle: SL-/TP-Zone, TP1-Linie, Target, Entry-Label
+// Alle noch offenen Trades einer Range zum Marktpreis schliessen (Session-Flush)
+f_flushGroup(array<Trade> trades, string grp, int t, float px) =>
+    int n = trades.size()
+    if n > 0
+        for i = n - 1 to 0
+            Trade tr = trades.get(i)
+            if tr.grp == grp
+                f_q("close", tr.id, 0, na, na, na, na, na, false, "session flush")
+                f_closeTrade(tr, t, px, "TIME EXIT")
+                trades.remove(i)
+    true
+
+f_drawTradeVisuals(Trade tr, string entryTxt) =>
+    int   t = tr.entryTime
+    float e = tr.entry
+    if showTrades
+        tr.riskBox   := box.new(t, math.max(e, tr.sl), t + 60000, math.min(e, tr.sl), xloc = xloc.bar_time, bgcolor = colRisk, border_color = color.new(colRisk, 100))
+        tr.rewardBox := box.new(t, math.max(e, tr.tp2), t + 60000, math.min(e, tr.tp2), xloc = xloc.bar_time, bgcolor = colReward, border_color = color.new(colReward, 100))
+        if tr.dual
+            tr.tp1Line := line.new(t, tr.tp1, t + 60000, tr.tp1, xloc = xloc.bar_time, color = colFib, style = line.style_dashed)
+            label.new(t, tr.tp1, tr.tp1Txt, xloc = xloc.bar_time, style = label.style_label_right, color = color.new(color.black, 100), textcolor = colFib, size = size.tiny)
+        label.new(t, tr.tp2, tr.dual ? tr.tp2Txt + " · TARGET" : "TARGET " + tr.tp2Txt, xloc = xloc.bar_time, style = label.style_label_right, color = color.new(color.black, 100), textcolor = colBull, size = size.tiny)
+    if showEntry
+        label.new(t, e, entryTxt, xloc = xloc.bar_time, style = tr.dir == 1 ? label.style_label_up : label.style_label_down, color = tr.dir == 1 ? colBull : colBear, textcolor = color.white, size = size.small)
+    true
+
+// SL / TP-Level des Pre-Setups + Plausibilität (Entry zwischen SL und erstem TP)
+f_preLevels(Setup s, RangeObj asia, RangeObj pre, float entry) =>
+    int   d    = s.dir
+    float buf  = slBufferPct / 100.0 * (asia.hi - asia.lo)
+    float sl   = d == -1 ? s.sweepExt + buf : s.sweepExt - buf
+    float rng  = pre.hi - pre.lo
+    // Level ausgehend von der gesweepten Range-Seite (0 % = Kante, 100 % = Gegenseite)
+    float lvl1 = d == -1 ? pre.hi - tp1LevelPct  / 100.0 * rng : pre.lo + tp1LevelPct  / 100.0 * rng
+    float lvl2 = d == -1 ? pre.hi - tp2LevelPct  / 100.0 * rng : pre.lo + tp2LevelPct  / 100.0 * rng
+    float lvlF = d == -1 ? pre.lo : pre.hi
+    float lvlH = (pre.hi + pre.lo) / 2.0
+    float lvlC = d == -1 ? pre.hi - tpCustomPct / 100.0 * rng : pre.lo + tpCustomPct / 100.0 * rng
+    bool  dual = tpModeInput == TP_DUAL
+    float tp1  = dual ? lvl1 : tpModeInput == TP_FULL ? lvlF : tpModeInput == TP_HALF ? lvlH : lvlC
+    float tp2  = dual ? lvl2 : tp1
+    bool  ok   = not na(sl) and (d == -1 ? entry < sl and entry > tp1 : entry > sl and entry < tp1)
+    [ok, sl, tp1, tp2, dual]
+
+f_openTrade(Setup s, RangeObj asia, RangeObj pre, array<Trade> trades, string model, float entry, int entryT, int checkFrom) =>
+    int   d       = s.dir
+    [lvOk, sl, tp1, tp2, dual] = f_preLevels(s, asia, pre, entry)
+    bool  isFib   = model == s.tag + " FIB"
+    float q       = isFib ? s.fibQty : f_calcQty(entry, sl)
+    bool  allowed = f_allowed(d, s.grp)
+    bool  ntz     = f_inNoTradeZone(pre, entry)
+    bool  ok      = lvOk and allowed and not ntz and not na(q) and q > 0 and (not isFib or not na(s.fibOrderId))
+    if ok
+        string id = isFib ? s.fibOrderId : f_newId(model, d)
+        // Gegenrichtung derselben Range: offenes Fib-Limit stornieren (keine Gegenpositionen)
+        if s.grp == "ASIA"
+            if d == -1 and asiaL.fibArmed
+                f_cancelFib(asiaL, entryT)
+            if d == 1 and asiaS.fibArmed
+                f_cancelFib(asiaS, entryT)
+        if s.grp == "LDN"
+            if d == -1 and ldnL.fibArmed
+                f_cancelFib(ldnL, entryT)
+            if d == 1 and ldnS.fibArmed
+                f_cancelFib(ldnS, entryT)
+        if s.grp == "NY"
+            if d == -1 and nyLong.fibArmed
+                f_cancelFib(nyLong, entryT)
+            if d == 1 and nyShort.fibArmed
+                f_cancelFib(nyShort, entryT)
+        if s.grp == "LUNCH"
+            if d == -1 and lunchLong.fibArmed
+                f_cancelFib(lunchLong, entryT)
+            if d == 1 and lunchShort.fibArmed
+                f_cancelFib(lunchShort, entryT)
+        if not isFib    // Fib: Limit-Order + Exits wurden bereits beim Setzen der Limit platziert
+            f_q("entry", id, d, q, na, na, na, na, false, model)
+            f_placeExits(id, dual, q, tp1, tp2, sl)
+        Trade tr = Trade.new(dir = d, model = model, entry = entry, sl = sl, tp1 = tp1, tp2 = tp2, dual = dual, entryTime = entryT, checkFrom = checkFrom, id = id, qty = q, grp = s.grp, closeT = f_closeTime(s.grp), beOnTp1 = beAfterTp1, tp1Txt = "TP1 " + str.tostring(tp1LevelPct, "#") + "%", tp2Txt = dual ? "TP2 " + str.tostring(tp2LevelPct, "#") + "%" : tpModeInput == TP_FULL ? "TP 100%" : tpModeInput == TP_HALF ? "TP 50%" : "TP " + str.tostring(tpCustomPct, "#") + "%")
+        f_drawTradeVisuals(tr, (d == 1 ? "A+ LONG ↑" : "A+ SHORT ↓") + "\n" + model + (s.isNY ? " · Pre sweep" : s.preSwept ? " · Asia+Pre sweep" : " · Asia sweep"))
+        string msg = (d == 1 ? "A+ LONG" : "A+ SHORT") + "\n" + syminfo.ticker + (s.isNY ? "\n" + s.tag + " range sweep & reclaim" : "\nLondon pre-range sweep & reclaim") + "\nModell: " + model + "\nConfirmation: " + (isFib ? "Limit-Fill (M1)" : "M5 Close") + "\nEntry: " + f_px(entry) + "\nSL: " + f_px(sl) + (dual ? "\nTP1: " + f_px(tp1) + "\nTP2: " + f_px(tp2) : "\nTarget: " + f_px(tp1))
+        alert(msg, alert.freq_once_per_bar_close)
+        trades.push(tr)
+        s.trades  := s.trades + 1
+        s.cnt.n := s.cnt.n + 1
+        s.sigTime := time
+        s.sigDir  := d
+        s.fibOrderId := na                     // gefüllte Fib-Order nicht stornieren
+        f_cancelFib(s, entryT)
+        s.resetCycle(checkFrom)                // Re-Entry nur nach neuem Sweep
+        s.state  := s.cnt.n >= s.maxTrades ? ST_MAX_TRADES : ST_WAIT_SWEEP
+        s.reason := "Trade " + str.tostring(s.trades) + " opened (" + model + ")" + (s.state == ST_WAIT_SWEEP ? " - waiting for a new sweep" : " - max. trades reached")
+    else
+        s.reason := ntz ? "Entry blocked (" + model + "): no-trade zone 50 % +/- " + str.tostring(noTradeZone) + " %" : not allowed ? "Entry blocked (" + model + "): " + f_blockReason(s.grp) : not lvOk ? "Entry rejected (" + model + "): price not between SL and first TP" : "Entry rejected (" + model + "): position size 0"
+    ok
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 10. STATE MACHINE – Teil A: pro M1-Intrabar (Ranges, Sweeps, Cutoff, Invalidierung, Fill)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Modell 3: Hilfsfunktionen
+// ───────────────────────────────────────────────────────────────────────────────────────
+// Richtung einer Kerze mit Stärkefilter: +1 starke Up-Kerze, -1 starke Down-Kerze, 0 = zählt nicht.
+// Zu kleine Körper (Doji) und Inside-Kerzen liefern 0 und gelten damit als "keine Kerze".
+f_cdir(int i) =>
+    float rngI  = high[i] - low[i]
+    float bodyI = math.abs(close[i] - open[i])
+    bool  big   = rngI > 0 and bodyI >= engBodyPct / 100.0 * rngI
+    bool  insideI = high[i] <= high[i + 1] and low[i] >= low[i + 1]
+    big and not insideI ? (close[i] > open[i] ? 1 : close[i] < open[i] ? -1 : 0) : 0
+
+// Ablehnungsgrund von Modell 3 direkt an die Kerze schreiben, damit er auch auf
+// historischen Tagen sichtbar bleibt (das Debug-Panel zeigt immer nur die letzte Kerze).
+f_engNote(string txt, int t, float px, bool up) =>
+    if showEng
+        label.new(t, px, txt, xloc = xloc.bar_time, style = up ? label.style_label_up : label.style_label_down, color = color.new(color.black, 100), textcolor = color.new(color.gray, 10), size = size.tiny)
+    true
+
+// Nächste Range-Kante, die zwischen Limit und Ziel liegt. Berührt der Preis sie,
+// bevor das Limit gefüllt ist, war die Bewegung eine Rejection an dieser Range.
+f_rejLevel(int d, float lim, float tp, RangeObj own) =>
+    float best = na
+    if engRejScope == "Own range edge only"
+        float e = d == 1 ? own.lo : own.hi
+        best := not na(e) and (d == 1 ? e > lim and e < tp : e < lim and e > tp) ? e : na
+    else
+        for k = 0 to 7
+            RangeObj r = k < 2 ? asiaR : k < 4 ? preR : k < 6 ? lunchR : nyPreR
+            float e = k % 2 == 0 ? r.lo : r.hi
+            if r.complete and not na(e)
+                if d == 1 and e > lim and e < tp and (na(best) or e < best)
+                    best := e
+                if d == -1 and e < lim and e > tp and (na(best) or e > best)
+                    best := e
+    best
+
+f_fivUse(string tag) =>
+    not useFiv ? false : tag == "ASIA" ? fivAsia : tag == "LONDON" ? fivLdn : tag == "LUNCH" ? fivLun : tag == "NY" ? fivNy : false
+
+f_fivTf(string tf) =>
+    tf == "M5" ? fivM5 : tf == "M15" ? fivM15 : tf == "H1" ? fivH1 : tf == "H4" ? fivH4 : false
+
+f_cancelFiv(Setup s, int t) =>
+    if s.fivArmed and not na(s.fivOrderId)
+        f_q("cancel", s.fivOrderId, 0, na, na, na, na, na, false, "")
+    if not na(s.fivLine)
+        s.fivLine.set_x2(t)
+        s.fivLine := na
+    s.fivArmed   := false
+    s.fivOrderId := na
+    s.fivLimit   := na
+    true
+
+// Limit gefüllt → Trade-Datensatz anlegen
+f_openFiv(Setup s, Counter cnt, array<Trade> trades, int t) =>
+    Trade tr = Trade.new(dir = s.dir, model = s.tag + " FVGI", entry = s.fivLimit, sl = s.fivSL, tp1 = s.fivTP, tp2 = s.fivTP2,
+                         dual = s.fivDual, entryTime = t, checkFrom = t, id = s.fivOrderId, qty = s.fivQty, grp = s.grp,
+                         closeT = f_closeTime(s.grp), beOnTp1 = beAfterTp1,
+                         tp1Txt = "TP1 " + str.tostring(tp1LevelPct, "#") + "%",
+                         tp2Txt = s.fivDual ? "TP2 " + str.tostring(tp2LevelPct, "#") + "%" : "TP")
+    f_drawTradeVisuals(tr, (s.dir == 1 ? "A+ LONG ↑" : "A+ SHORT ↓") + "\n" + s.tag + " FVG INVERSION")
+    alert((s.dir == 1 ? "A+ LONG" : "A+ SHORT") + "\n" + syminfo.ticker + "\n" + s.tag + " FVG inversion\nEntry: " + f_px(s.fivLimit) + "\nSL: " + f_px(s.fivSL), alert.freq_once_per_bar_close)
+    trades.push(tr)
+    s.trades  := s.trades + 1
+    if na(s.fivCnt)
+        cnt.n := cnt.n + 1
+    else
+        s.fivCnt.n := s.fivCnt.n + 1
+    s.sigTime := time
+    s.sigDir  := s.dir
+    s.fivArmed   := false
+    s.fivOrderId := na
+    s.reason     := s.tag + " FVG inversion filled @ " + f_px(s.fivLimit)
+    true
+
+// Bar-Close-Logik von Modell 4
+f_fivStep(Setup s, RangeObj pre, Counter cnt, array<Trade> trades, float c, int tOpen, int tClose, bool inWin) =>
+    bool detWin = tClose > s.entryStartT and tOpen < math.max(s.fibEndT, s.entryEndT)
+    // --- Ausbruchs-Fenster pflegen: beginnt mit dem ersten Close jenseits der Kante,
+    //     endet beim ersten Close zurück in der Range oder nach fivBrkBars Kerzen.
+    if f_fivUse(s.tag) and pre.complete and not na(pre.hi)
+        bool beyond = s.dir == 1 ? c < pre.lo : c > pre.hi
+        if not s.brkOpen
+            if beyond
+                s.brkOpen := true
+                s.brkFrom := tOpen
+                s.brkTo   := tClose
+                s.brkBars := 1
+        else
+            if not beyond or s.brkBars >= fivBrkBars
+                s.brkOpen := false
+            else
+                s.brkBars := s.brkBars + 1
+                s.brkTo   := tClose
+    if f_fivUse(s.tag) and pre.complete and not na(pre.hi) and detWin and not s.fivArmed and inWin
+        int   d   = s.dir
+        float rng = pre.hi - pre.lo
+        float mid = (pre.hi + pre.lo) / 2.0
+        float lvl = na        // Limit-Level = invertierte Kante
+        float opp = na        // Gegenkante der FVG = Basis für den SL
+        int   zt  = 0
+        for z in fvgs
+            bool fromBrk = s.brkFrom > 0 and z.seen >= s.brkFrom and z.seen <= s.brkTo
+            if z.inv and not z.used and z.dir == -d and f_fivTf(z.tf) and fromBrk
+                // Die FVG darf die Ausbruchskante überlappen, aber nicht bis zur Range-Mitte reichen
+                if d == 1 and z.top <= mid and pre.lo - z.top <= fivDistPct / 100.0 * rng
+                    if na(lvl) or z.top > lvl
+                        lvl := z.top
+                        opp := z.bot
+                        zt  := z.invT
+                        s.fivZone := z
+                if d == -1 and z.bot >= mid and z.bot - pre.hi <= fivDistPct / 100.0 * rng
+                    if na(lvl) or z.bot < lvl
+                        lvl := z.bot
+                        opp := z.top
+                        zt  := z.invT
+                        s.fivZone := z
+        if not na(lvl)
+            float sl  = d == 1 ? opp - slBufferPct / 100.0 * rng : opp + slBufferPct / 100.0 * rng
+            float f1  = d == 1 ? pre.lo + tp1LevelPct  / 100.0 * rng : pre.hi - tp1LevelPct  / 100.0 * rng
+            float f2  = d == 1 ? pre.lo + tp2LevelPct  / 100.0 * rng : pre.hi - tp2LevelPct  / 100.0 * rng
+            float fF  = d == 1 ? pre.hi : pre.lo
+            float fH  = (pre.hi + pre.lo) / 2.0
+            float fC  = d == 1 ? pre.lo + tpCustomPct / 100.0 * rng : pre.hi - tpCustomPct / 100.0 * rng
+            bool  fdual = tpModeInput == TP_DUAL
+            float tp  = fdual ? f1 : tpModeInput == TP_FULL ? fF : tpModeInput == TP_HALF ? fH : fC
+            float tpB = fdual ? f2 : tp
+            bool  lvOk = d == 1 ? lvl > sl and lvl < tp : lvl < sl and lvl > tp
+            float q    = lvOk ? f_calcQty(lvl, sl) : na
+            if not f_allowed(d, s.grp)
+                s.reason := s.tag + " FVG inversion blocked: " + f_blockReason(s.grp)
+            else if f_inNoTradeZone(pre, lvl)
+                s.reason := s.tag + " FVG inversion blocked: no-trade zone"
+            else if (na(s.fivCnt) ? cnt.n : s.fivCnt.n) >= (fivOwnMax > 0 ? fivOwnMax : s.maxTrades)
+                s.reason := s.tag + " FVG inversion blocked: max. trades reached"
+            else if not lvOk or na(q) or q <= 0
+                s.reason := s.tag + " FVG inversion rejected: level or position size invalid"
+            else
+                s.fivArmed   := true
+                if not na(s.fivZone)
+                    s.fivZone.used := true     // jede invertierte FVG wird nur einmal gehandelt
+                s.fivLimit   := lvl
+                s.fivSL      := sl
+                s.fivTP      := tp
+                s.fivTP2     := tpB
+                s.fivDual    := fdual
+                s.fivQty     := q
+                s.fivOrderId := f_newId(s.tag + " FVGI", d)
+                f_q("limit", s.fivOrderId, d, q, lvl, na, na, na, false, s.tag + " FVGI")
+                f_placeExits(s.fivOrderId, fdual, q, tp, tpB, sl)
+                s.reason     := s.tag + " FVG inversion limit @ " + f_px(lvl)
+                if showFiv
+                    s.fivLine := line.new(tClose, lvl, math.max(s.fibEndT, s.entryEndT), lvl, xloc = xloc.bar_time, color = colReclaim, width = 2)
+                    box.new(zt, math.max(lvl, opp), tClose, math.min(lvl, opp), xloc = xloc.bar_time, border_color = colReclaim, bgcolor = color.new(colReclaim, 88))
+                    label.new(tClose, lvl, s.tag + " FVGI " + (d == 1 ? "BUY" : "SELL") + " LIMIT", xloc = xloc.bar_time, style = label.style_label_right, color = color.new(color.black, 100), textcolor = colReclaim, size = size.tiny)
+    true
+
+f_engUse(string tag) =>
+    not useEng ? false : tag == "ASIA" ? engAsia : tag == "LONDON" ? engLdn : tag == "LUNCH" ? engLun : tag == "NY" ? engNy : false
+
+f_cancelEng(Setup s, int t) =>
+    if s.engArmed and not na(s.engOrderId)
+        f_q("cancel", s.engOrderId, 0, na, na, na, na, na, false, "")
+    if not na(s.engLine)
+        s.engLine.set_x2(t)
+        s.engLine := na
+    s.engArmed   := false
+    s.engOrderId := na
+    s.engLimit   := na
+    true
+
+// Limit wurde intrabar gefüllt → Trade-Datensatz anlegen
+f_openEng(Setup s, Counter cnt, array<Trade> trades, int t) =>
+    Trade tr = Trade.new(dir = s.dir, model = s.tag + " ENG", entry = s.engLimit, sl = s.engSL, tp1 = s.engTP, tp2 = s.engTP2,
+                         dual = s.engDual, entryTime = t, checkFrom = t, id = s.engOrderId, qty = s.engQty, grp = s.grp,
+                         closeT = f_closeTime(s.grp), beOnTp1 = beAfterTp1,
+                         tp1Txt = "TP1 " + str.tostring(tp1LevelPct, "#") + "%",
+                         tp2Txt = s.engDual ? "TP2 " + str.tostring(tp2LevelPct, "#") + "%" : tpModeInput == TP_FULL ? "TP 100%" : tpModeInput == TP_HALF ? "TP 50%" : "TP " + str.tostring(tpCustomPct, "#") + "%")
+    f_drawTradeVisuals(tr, (s.dir == 1 ? "A+ LONG ↑" : "A+ SHORT ↓") + "\n" + s.tag + " 3C ENGULF")
+    alert((s.dir == 1 ? "A+ LONG" : "A+ SHORT") + "\n" + syminfo.ticker + "\n" + s.tag + " 3-candle engulfing\nEntry: " + f_px(s.engLimit) + "\nSL: " + f_px(s.engSL) + "\nTarget: " + f_px(s.engTP), alert.freq_once_per_bar_close)
+    trades.push(tr)
+    s.trades  := s.trades + 1
+    if na(s.engCnt)
+        cnt.n := cnt.n + 1
+    else
+        s.engCnt.n := s.engCnt.n + 1
+    s.sigTime := time
+    s.sigDir  := s.dir
+    s.engArmed   := false
+    s.engOrderId := na
+    s.reason     := s.tag + " 3C engulf filled @ " + f_px(s.engLimit)
+    true
+
+// Bar-Close-Logik von Modell 3. Wird einmal pro bestätigter Chart-Kerze je Setup gerufen.
+f_engulfStep(Setup s, RangeObj pre, Counter cnt, array<Trade> trades, bool trio, float tExt, float tFar,
+             float tBodyExt, float tLastBody, bool sameDir, float c, float l, float h, int tOpen, int tClose, bool inWin) =>
+    // Erkennungsfenster: ab Beginn des Entry-Fensters bis zur Fib-Endzeit der Range.
+    // Davor und danach wird nichts mehr gezeichnet, damit keine alten Ranges in den
+    // Nachmittag hineinzeichnen.
+    bool detWin = tClose > s.entryStartT and tOpen < math.max(s.fibEndT, s.entryEndT)
+    if f_engUse(s.tag) and pre.complete and not na(pre.hi) and detWin
+        int   d   = s.dir
+        float rng = pre.hi - pre.lo
+        // 1) Neue Dreierserie. Sie muss KOMPLETT ausserhalb der Range liegen (auch die Dochte)
+        //    und darf höchstens engDistPct der Range-Höhe entfernt sein.
+        if trio
+            // "ausserhalb" = die Serie ENDET ausserhalb der Range: der Close der dritten
+            // Kerze liegt jenseits der Kante und das gemeinsame Extrem ebenfalls.
+            // Dochte dürfen in die Range hineinragen – eine Ausbruchsserie tut das immer.
+            // Eine Serie, die komplett in der Range verläuft, schliesst nie ausserhalb.
+            bool  outside = d == 1 ? c < pre.lo : c > pre.hi
+            float gap     = d == 1 ? pre.lo - tExt : tExt - pre.hi
+            if outside and gap > 0 and gap > engDistPct / 100.0 * rng
+                s.reason := s.tag + ": 3 candles ignored - " + str.tostring(gap / rng * 100, "#") + " % away, limit is " + str.tostring(engDistPct, "#") + " %"
+                engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                f_engNote("3C dist", tClose, c, d == 1)
+            if outside and gap > 0 and gap <= engDistPct / 100.0 * rng
+                f_cancelEng(s, tClose)
+                if not na(s.engBox)
+                    s.engBox.delete()
+                    s.engBox := na
+                s.trioValid := true
+                s.sweepTrio := true
+                s.trioSwept := false
+                s.trioAge   := 0
+                s.trioLo    := tExt
+                s.trioTrig  := tBodyExt
+                s.trioLimit := engLvlMode == "Body of the last of the three" ? tLastBody : tBodyExt
+                s.trioExt   := tExt
+                s.trioT     := tOpen
+                s.reason    := s.tag + ": 3 candles registered - waiting for engulf"
+                if showEng
+                    s.engBox := box.new(tOpen - 2 * (tClose - tOpen), math.max(s.trioTrig, s.trioLo), tClose, math.min(s.trioTrig, s.trioLo), xloc = xloc.bar_time, border_color = colSweep, bgcolor = color.new(colSweep, 85))
+                    label.new(tOpen, d == 1 ? s.trioLo : s.trioTrig, s.tag + " 3C", xloc = xloc.bar_time, style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.black, 100), textcolor = colSweep, size = size.tiny)
+        else if s.trioValid
+            s.trioAge := s.trioAge + 1
+            // 2) Vierte Kerze derselben Farbe direkt nach der Serie → keine Dreierformation,
+            //    Zeichnung wird gelöscht.
+            if s.trioAge == 1 and sameDir and engSeries == "Exactly three candles"
+                f_cancelEng(s, tClose)
+                if not na(s.engBox)
+                    // Ausbruchsserien bleiben sichtbar (sie entwerten weiter den OB-Entry),
+                    // nur gestrichelt und grau. Alle anderen werden gelöscht.
+                    if s.sweepTrio
+                        s.engBox.set_border_style(line.style_dotted)
+                        s.engBox.set_border_color(color.new(color.gray, 20))
+                        s.engBox.set_bgcolor(color.new(color.gray, 90))
+                    else
+                        s.engBox.delete()
+                    s.engBox := na
+                s.trioValid := false
+                s.reason    := s.tag + ": 4th candle in the same direction - 3-candle setup discarded"
+            else
+                // 3) Manipulation mitschreiben
+                if d == 1
+                    s.trioExt := math.min(s.trioExt, l)
+                    if l < s.trioLo
+                        s.trioSwept := true
+                else
+                    s.trioExt := math.max(s.trioExt, h)
+                    if h > s.trioLo
+                        s.trioSwept := true
+                // 4) Serie verfällt, wenn der Preis jenseits ihres Extrems schliesst
+                if d == 1 ? c < s.trioLo : c > s.trioLo
+                    f_cancelEng(s, tClose)
+                    if not na(s.engBox)
+                        if s.sweepTrio
+                            s.engBox.set_border_style(line.style_dotted)
+                            s.engBox.set_border_color(color.new(color.gray, 20))
+                            s.engBox.set_bgcolor(color.new(color.gray, 90))
+                        else
+                            s.engBox.delete()
+                        s.engBox := na
+                    s.trioValid := false
+                    s.reason    := s.tag + ": 3-candle setup invalidated - close beyond the low/high"
+                else if engNeedSweep and not s.trioSwept and (d == 1 ? c > s.trioTrig : c < s.trioTrig)
+                    s.reason := s.tag + " 3C engulf ignored: low/high of the three was never swept"
+                    engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                    f_engNote("3C no sweep", tClose, c, d == 1)
+                // 5) Engulf: Close jenseits des Körper-Extrems der drei Kerzen → Limit setzen
+                else if not s.engArmed and (not engNeedSweep or s.trioSwept) and (d == 1 ? c > s.trioTrig : c < s.trioTrig) and not inWin
+                    s.reason := s.tag + " 3C engulf ignored: outside the entry window (trigger " + f_px(s.trioTrig) + ")"
+                    engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                    f_engNote("3C window", tClose, c, d == 1)
+                else if not s.engArmed and inWin and (not engNeedSweep or s.trioSwept) and (d == 1 ? c > s.trioTrig : c < s.trioTrig)
+                    float lim = s.trioLimit
+                    float sl  = d == 1 ? s.trioExt - slBufferPct / 100.0 * rng : s.trioExt + slBufferPct / 100.0 * rng
+                    // TP-Level exakt wie bei Modell 1 und 2: gemessen von der gesweepten Range-Seite
+                    float e1  = d == 1 ? pre.lo + tp1LevelPct  / 100.0 * rng : pre.hi - tp1LevelPct  / 100.0 * rng
+                    float e2  = d == 1 ? pre.lo + tp2LevelPct  / 100.0 * rng : pre.hi - tp2LevelPct  / 100.0 * rng
+                    float eF  = d == 1 ? pre.hi : pre.lo
+                    float eH  = (pre.hi + pre.lo) / 2.0
+                    float eC  = d == 1 ? pre.lo + tpCustomPct / 100.0 * rng : pre.hi - tpCustomPct / 100.0 * rng
+                    bool  edual = tpModeInput == TP_DUAL
+                    float tp  = edual ? e1 : tpModeInput == TP_FULL ? eF : tpModeInput == TP_HALF ? eH : eC
+                    float tpB = edual ? e2 : tp
+                    bool  lvOk = d == 1 ? lim > sl and lim < tp : lim < sl and lim > tp
+                    float q    = lvOk ? f_calcQty(lim, sl) : na
+                    if not f_allowed(d, s.grp)
+                        s.reason := s.tag + " 3C engulf blocked: " + f_blockReason(s.grp)
+                        engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                        f_engNote("3C blocked", tClose, c, d == 1)
+                    else if f_inNoTradeZone(pre, lim)
+                        s.reason := s.tag + " 3C engulf blocked: no-trade zone"
+                        engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                        f_engNote("3C no-trade zone", tClose, c, d == 1)
+                    else if (na(s.engCnt) ? cnt.n : s.engCnt.n) >= (engOwnMax > 0 ? engOwnMax : s.maxTrades)
+                        s.reason := s.tag + " 3C engulf blocked: max. trades reached"
+                        engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                        f_engNote("3C max trades", tClose, c, d == 1)
+                    else if not lvOk or na(q) or q <= 0
+                        s.reason := s.tag + " 3C engulf rejected: level or position size invalid"
+                        engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                        f_engNote("3C level", tClose, c, d == 1)
+                    else
+                        s.engArmed   := true
+                        s.engLimit   := lim
+                        s.engSL      := sl
+                        s.engTP      := tp
+                        s.engTP2     := tpB
+                        s.engDual    := edual
+                        s.engQty     := q
+                        s.engRej     := engRejCancel ? f_rejLevel(d, lim, tp, pre) : na
+                        s.engOrderId := f_newId(s.tag + " ENG", d)
+                        f_q("limit", s.engOrderId, d, q, lim, na, na, na, false, s.tag + " ENG")
+                        f_placeExits(s.engOrderId, edual, q, tp, tpB, sl)
+                        s.reason     := s.tag + " 3C engulf limit @ " + f_px(lim)
+                        engMsg.set(0, str.format_time(tClose, "HH:mm", tzInput) + " " + s.reason)
+                        if showEng
+                            s.engLine := line.new(tClose, lim, math.max(s.fibEndT, s.entryEndT), lim, xloc = xloc.bar_time, color = colSweep, width = 2)
+                            label.new(tClose, lim, s.tag + " 3C " + (d == 1 ? "BUY" : "SELL") + " LIMIT", xloc = xloc.bar_time, style = label.style_label_right, color = color.new(color.black, 100), textcolor = colSweep, size = size.tiny)
+    true
+
+f_stepIntrabar(Setup s, RangeObj asia, RangeObj pre, SessionTimes st, array<Trade> trades, int t, float h, float l) =>
+    // Ranges und Trade-Management laufen zentral in MAIN, damit sie auch ohne dieses
+    // Legacy-Setup gebildet bzw. verwaltet werden.
+    // Session-Übergänge
+    if s.state == ST_BUILD_ASIA and t >= st.asiaEnd
+        if asia.bars > 0
+            asia.complete := true
+            s.state  := ST_BUILD_PRE
+            s.reason := "Asia range complete - building pre-range"
+        else
+            s.state  := ST_NO_DATA
+            s.reason := "No data in the Asia window"
+    if s.state == ST_BUILD_PRE and t >= st.preEnd
+        if pre.bars > 0
+            pre.complete := true
+            [d, pos, gap] = f_validateLocation(asia, pre)
+            s.locPos := pos
+            s.locGap := gap
+            if d != 0
+                s.dir    := d
+                s.state  := ST_WAIT_SWEEP
+                s.reason := "Location valid (" + (d == 1 ? "LONG" : "SHORT") + ") - waiting for sweep"
+            else
+                s.state  := ST_INVALID_LOC
+                s.reason := "Pre-range not at an Asia edge (or covers both extremes)"
+            if showDebugLbl
+                label.new(st.preEnd, pre.hi, "LOC " + (d == 1 ? "LONG ok" : d == -1 ? "SHORT ok" : "✗") + "\nPos " + f_pct(pos) + " · Gap " + f_pct(gap), xloc = xloc.bar_time, style = label.style_label_lower_left, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+        else
+            s.state  := ST_NO_DATA
+            s.reason := "No data in the pre-range window"
+
+    // D) Zyklus-Extreme (beide Seiten, Asia-Sweep ab Asia-Ende, Pre-Sweep ab Pre-Ende)
+    if s.state >= ST_BUILD_PRE and s.state <= ST_WAIT_ENTRY and t >= st.asiaEnd and t >= s.cycStart
+        if na(s.cycMaxAll) or h > s.cycMaxAll
+            s.cycMaxAll  := h
+            s.cycMaxAllT := t
+        if na(s.cycMinAll) or l < s.cycMinAll
+            s.cycMinAll  := l
+            s.cycMinAllT := t
+        if t >= st.preEnd
+            if na(s.cycMaxPost) or h > s.cycMaxPost
+                s.cycMaxPost  := h
+                s.cycMaxPostT := t
+            if na(s.cycMinPost) or l < s.cycMinPost
+                s.cycMinPost  := l
+                s.cycMinPostT := t
+
+    if s.state >= ST_WAIT_SWEEP and s.state <= ST_WAIT_ENTRY
+        // E) Sweep-Status + Sweep-Extrem (aktualisiert sich mit neuen Hochs/Tiefs)
+        float dist  = legAsiaSwDist / 100.0 * (asia.hi - asia.lo)     // Asia edge (legacy model)
+        float distP = s.swDistPct / 100.0 * (pre.hi - pre.lo)          // London pre-range edge
+        bool  dsReq = doubleSweepInput == DS_REQ
+        if s.dir == -1
+            s.asiaSwept := not na(s.cycMaxAll)  and s.cycMaxAll  > asia.hi + dist
+            s.preSwept  := not na(s.cycMaxPost) and s.cycMaxPost > pre.hi  + distP
+            s.sweepExt  := dsReq ? s.cycMaxPost  : s.cycMaxAll
+            s.sweepExtT := dsReq ? s.cycMaxPostT : s.cycMaxAllT
+        else
+            s.asiaSwept := not na(s.cycMinAll)  and s.cycMinAll  < asia.lo - dist
+            s.preSwept  := not na(s.cycMinPost) and s.cycMinPost < pre.lo  - distP
+            s.sweepExt  := dsReq ? s.cycMinPost  : s.cycMinAll
+            s.sweepExtT := dsReq ? s.cycMinPostT : s.cycMinAllT
+
+        // F) Cutoff: keine neuen Trades, Limits löschen
+        bool fibWaiting = useFib and s.state == ST_WAIT_ENTRY and s.fibEligible
+        if t >= s.fibEndT or (t >= st.cutoff and not fibWaiting)
+            f_cancelFib(s, t)
+            s.state  := ST_CUTOFF
+            s.reason := t >= s.fibEndT ? "Fib end time reached - limit cancelled" : "Cutoff reached - no new trades, limits cancelled"
+        // G) Invalidierung: Gegenseite der Pre-Range vor Entry erreicht
+        else if t >= st.preEnd and (s.dir == -1 ? l <= pre.lo : h >= pre.hi)
+            f_invalidate(s, pre, t, "Opposite side reached before entry")
+        // H) Fib-Limit Fill (Docht-Berührung)
+        else if s.state == ST_WAIT_ENTRY and s.fibArmed and t >= s.fibArmTime
+            if s.dir == -1 ? h >= s.fibLimit : l <= s.fibLimit
+                string pid = s.fibOrderId
+                bool ok = f_openTrade(s, asia, pre, trades, s.tag + " FIB", s.fibLimit, t, t + 60000)
+                if not ok
+                    f_cancelFib(s, t)
+                    if not na(pid)
+                        f_q("close", pid, 0, na, na, na, na, na, false, "blocked")
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 10. STATE MACHINE – Teil B: pro M5-Close (Sweep bestätigt, OB, Reclaim, OB-Entry, Fib)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_stepBarClose(Setup s, RangeObj asia, RangeObj pre, SessionTimes st, array<Trade> trades, float h, float l, float c, float o, float prevH, float prevL, int tOpen, int tClose) =>
+    if s.state >= ST_WAIT_SWEEP and s.state <= ST_WAIT_ENTRY and tClose > s.preEndT
+        int  d            = s.dir
+        bool inside       = c < pre.hi and c > pre.lo
+        bool outsideSwept = d == -1 ? c > pre.hi : c < pre.lo
+        bool sweepOK      = s.isNY ? s.preSwept : s.asiaSwept and (s.preSwept or doubleSweepInput == DS_OPT)
+        bool inEntryWin   = tOpen < s.entryEndT and tClose > s.entryStartT
+        bool inFibWin     = tOpen < s.fibEndT and tClose > s.entryStartT
+
+        // --- Orderblock: erste Kerze des Zyklus, die außerhalb der Pre-Range (Sweep-Seite) schließt
+        if not s.obValid and outsideSwept and tClose > s.cycStart
+            s.obValid  := true
+            s.obHi     := h
+            s.obLo     := l
+            s.obBodyHi := math.max(o, c)
+            s.obBodyLo := math.min(o, c)
+            s.obTime   := tOpen
+            if showOB
+                s.obBox := box.new(tOpen, s.obBodyHi, s.entryEndT, s.obBodyLo, xloc = xloc.bar_time, bgcolor = colOB, border_color = color.new(colOB, 40), text = s.tag + " OB", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+
+        // --- Sweep bestätigt
+        if s.state == ST_WAIT_SWEEP and sweepOK
+            s.state  := ST_WAIT_RECLAIM
+            s.reason := "Sweep detected - waiting for reclaim"
+            if showSweep
+                s.sweepLbl := label.new(s.sweepExtT, s.sweepExt, "SWEEP", xloc = xloc.bar_time, style = d == -1 ? label.style_label_down : label.style_label_up, color = colSweep, textcolor = color.white, size = size.small)
+        if not na(s.sweepLbl)
+            s.sweepLbl.set_xy(s.sweepExtT, s.sweepExt)
+            s.sweepLbl.set_text(s.isNY ? "SWEEP " + s.tag : s.preSwept ? "SWEEP ASIA+PRE" : "SWEEP ASIA")
+
+        // --- Reclaim = OB-Reclaim: M5-Close jenseits des OB (Body/Docht) UND zurück in der Pre-Range
+        //     Ein reiner Range-Reclaim ohne OB zählt NICHT.
+        float obTrig    = obTriggerInput == OB_WICK ? (d == -1 ? s.obLo : s.obHi) : (d == -1 ? s.obBodyLo : s.obBodyHi)
+        bool  obReclaim = s.obValid and s.obTime < tOpen and not na(obTrig) and (d == -1 ? c < obTrig : c > obTrig)
+        bool justReclaimed = false
+        if s.state == ST_WAIT_RECLAIM and sweepOK and inside and obReclaim
+            s.state        := ST_WAIT_ENTRY
+            s.reclaimTime  := tOpen
+            s.reclaimDepth := f_depth(d, pre, c)
+            s.recExt       := d == -1 ? l : h
+            s.recFixed     := false
+            justReclaimed  := true
+            s.fibEligible  := f_depth(d, pre, c) >= s.fibDepthPct   // Close der Reclaim-Kerze entscheidet
+            s.reason       := "Reclaim (depth " + f_pct(s.reclaimDepth) + ") - waiting for entry"
+            if showReclaim
+                label.new(tOpen, c, s.isNY ? s.tag + " RECLAIM" : "RECLAIM", xloc = xloc.bar_time, style = d == -1 ? label.style_label_up : label.style_label_down, color = colReclaim, textcolor = color.white, size = size.tiny)
+
+        // --- Close wieder außerhalb → zurück zu WAIT_RECLAIM (Sweep-Extrem läuft weiter)
+        if s.state == ST_WAIT_ENTRY and not justReclaimed and outsideSwept
+            f_cancelFib(s, tClose)
+            s.state        := ST_WAIT_RECLAIM
+            s.reclaimTime  := na
+            s.reclaimDepth := na
+            s.recExt       := na
+            s.recFixed     := false
+            s.fibEligible  := false
+            s.reason       := "Close back outside - waiting for another reclaim"
+
+        if s.state == ST_WAIT_ENTRY
+            // --- Liquiditäts-Filter: gilt NUR für Modell 1 (Reclaim/OB-Entry).
+            //     Das Fib-Limit bleibt ungefiltert – dort ist das Setup bereits bestätigt.
+            bool liqOK = f_liqOK(s)
+            if not liqOK and inEntryWin and inside and obReclaim
+                s.reason := "Entry blocked (" + s.tag + "): " + f_liqReason(s)
+            // --- Ausbruch bestand aus drei starken Kerzen? Dann reicht der OB-Reclaim nicht,
+            //     es muss die Dreierserie engulfed werden (Modell 3 übernimmt).
+            bool trioBlock = engBlocksOB and useEng and s.sweepTrio
+            if trioBlock and inEntryWin and inside and obReclaim
+                s.reason := "Entry blocked (" + s.tag + "): break consisted of 3 candles - engulf required"
+            // --- Modell 1: OB-Entry (nur im Entry-Fenster)
+            bool entered = false
+            if useOB and inside and obReclaim and inEntryWin and liqOK and not trioBlock
+                if f_depth(d, pre, c) <= s.obDepthPct
+                    entered := f_openTrade(s, asia, pre, trades, s.tag + " OB", c, tClose, tClose)
+
+            // --- Modell 2: Reclaim-Extrem tracken → fixieren → Limit auf Fib-Level
+            if not entered and s.state == ST_WAIT_ENTRY and useFib
+                bool newExt = d == -1 ? l < s.recExt : h > s.recExt
+                if newExt
+                    s.recExt := d == -1 ? l : h
+                    if s.fibArmed
+                        // Limit wandert mit dem neuen Extrem (bleibt fixiert → wird unten sofort neu gesetzt)
+                        f_cancelFib(s, tClose)
+                        s.reason := "New reclaim extreme - limit follows"
+                    else
+                        s.recFixed := false
+                else if not s.recFixed and tOpen > s.reclaimTime and (d == -1 ? c > prevH : c < prevL)
+                    s.recFixed := true
+                // Gegenposition / Tages-Sperre während aktiver Limit → Limit löschen
+                if s.fibArmed and not f_allowed(d, s.grp)
+                    f_cancelFib(s, tClose)
+                    s.reason := "Fib limit cancelled: " + f_blockReason(s.grp)
+                if s.recFixed and not s.fibArmed and inFibWin and s.fibEligible
+                    float lim = d == -1 ? s.recExt + fibLevel * (s.sweepExt - s.recExt) : s.recExt - fibLevel * (s.recExt - s.sweepExt)
+                    [lvOk, lsl, ltp1, ltp2, ldual] = f_preLevels(s, asia, pre, lim)
+                    float lq = f_calcQty(lim, lsl)
+                    if f_inNoTradeZone(pre, lim)
+                        s.reason := "Fib limit blocked: no-trade zone 50 % +/- " + str.tostring(noTradeZone) + " %"
+                    else if not f_allowed(d, s.grp)
+                        s.reason := "Fib limit blocked: " + f_blockReason(s.grp)
+                    else if not lvOk
+                        s.reason := "Fib limit rejected: price not between SL and first TP"
+                    else if na(lq) or lq <= 0
+                        s.reason := "Fib limit rejected: position size 0"
+                    else
+                        s.fibLimit   := lim
+                        s.fibArmed   := true
+                        s.fibArmTime := tClose
+                        s.fibQty     := lq
+                        s.fibOrderId := f_newId(s.tag + " FIB", d)
+                        f_q("limit", s.fibOrderId, d, lq, lim, na, na, na, false, s.tag + " FIB")
+                        f_placeExits(s.fibOrderId, ldual, lq, ltp1, ltp2, lsl)
+                        s.reason     := "Fib limit placed @ " + f_px(s.fibLimit)
+                        if showFib
+                            s.fibLine := line.new(tClose, s.fibLimit, s.fibEndT, s.fibLimit, xloc = xloc.bar_time, color = colFib, width = 2)
+                            label.new(tClose, s.fibLimit, (s.isNY ? s.tag + " " : "") + (d == -1 ? "SELL" : "BUY") + " LIMIT " + str.tostring(fibLevel), xloc = xloc.bar_time, style = label.style_label_right, color = color.new(color.black, 100), textcolor = colFib, size = size.tiny)
+                        alert((d == 1 ? "A+ LONG" : "A+ SHORT") + " – " + s.tag + " FIB LIMIT PLACED\n" + syminfo.ticker + "\nLimit: " + f_px(s.fibLimit) + "\nSL: " + f_px(lsl), alert.freq_once_per_bar_close)
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 10c. EIGENSTÄNDIGE RANGES (NY, Lunch) – pro M1-Intrabar, eine Instanz pro Richtung
+//      Bar-Close-Logik (OB, Reclaim, OB-Entry, Fib) = f_stepBarClose (gemeinsam mit London)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_rangeStepIntrabar(Setup s, RangeObj pre, Counter cnt, array<Trade> trades, int t, float h, float l) =>
+    if s.state == ST_BUILD_PRE and t >= s.preEndT
+        if pre.bars > 0
+            pre.complete := true
+            s.state  := ST_WAIT_SWEEP
+            s.reason := s.tag + " range complete - waiting for sweep of the " + (s.dir == -1 ? "high" : "low")
+        else
+            s.state  := ST_NO_DATA
+            s.reason := "No data in the " + s.tag + " range window"
+
+    // Modell 4: Limit-Fill prüfen
+    if s.fivArmed and not na(s.fivLimit)
+        if not f_allowed(s.dir, s.grp) or (na(s.fivCnt) ? cnt.n : s.fivCnt.n) >= (fivOwnMax > 0 ? fivOwnMax : s.maxTrades)
+            f_cancelFiv(s, t)
+            s.reason := s.tag + " FVG inversion limit cancelled: " + f_blockReason(s.grp)
+        else if s.dir == 1 ? l <= s.fivLimit : h >= s.fivLimit
+            f_openFiv(s, cnt, trades, t)
+
+    // Modell 3 läuft unabhängig von der Sweep/Reclaim-State-Machine: Limit-Fill prüfen
+    if s.engArmed and not na(s.engLimit)
+        if engRejCancel and not na(s.engRej) and (s.dir == 1 ? h >= s.engRej : l <= s.engRej)
+            // Rejection an einer Range-Kante vor dem Fill → Setup entwertet
+            f_cancelEng(s, t)
+            s.reason := s.tag + " 3C limit cancelled: range edge " + f_px(s.engRej) + " reached before the fill"
+            engMsg.set(0, str.format_time(t, "HH:mm", tzInput) + " " + s.reason)
+            f_engNote("3C rejected at range", t, s.engRej, s.dir == 1)
+            s.engRej := na
+        else if not f_allowed(s.dir, s.grp) or (na(s.engCnt) ? cnt.n : s.engCnt.n) >= (engOwnMax > 0 ? engOwnMax : s.maxTrades)
+            f_cancelEng(s, t)
+            s.reason := s.tag + " 3C engulf limit cancelled: " + f_blockReason(s.grp)
+        else if s.dir == 1 ? l <= s.engLimit : h >= s.engLimit
+            f_openEng(s, cnt, trades, t)
+
+    if s.state >= ST_WAIT_SWEEP and s.state <= ST_WAIT_ENTRY
+        // Sweep-Extrem ab Range-Ende (Sweep darf vor dem Entry-Fenster passieren)
+        if t >= s.preEndT and t >= s.cycStart
+            if na(s.cycMaxPost) or h > s.cycMaxPost
+                s.cycMaxPost  := h
+                s.cycMaxPostT := t
+            if na(s.cycMinPost) or l < s.cycMinPost
+                s.cycMinPost  := l
+                s.cycMinPostT := t
+        // --- Liquiditäts-Filter: Flags im laufenden Zyklus setzen
+        if t >= s.preEndT and t >= s.cycStart and pre.complete
+            if useSwingFilter
+                if na(s.liqLvl)
+                    s.liqLvl := f_nearestLvl(s.dir, pre)
+                if not na(s.liqLvl) and (s.dir == -1 ? h > s.liqLvl : l < s.liqLvl)
+                    s.liqSwept := true
+            if useFvgFilter and not s.fvgTapped
+                s.fvgTapped := f_zoneTap(fvgs, s.dir, pre, h, l, 0.0, t, showFvg, colFib, "FVG")
+            if useObFilter and not s.obTapped
+                s.obTapped := f_zoneTap(obz, s.dir, pre, h, l, obDispPct / 100.0 * (pre.hi - pre.lo), t, showObZones, colOB, "OB")
+
+        float dist = s.swDistPct / 100.0 * (pre.hi - pre.lo)
+        if s.dir == -1
+            s.preSwept  := not na(s.cycMaxPost) and s.cycMaxPost > pre.hi + dist
+            s.sweepExt  := s.cycMaxPost
+            s.sweepExtT := s.cycMaxPostT
+        else
+            s.preSwept  := not na(s.cycMinPost) and s.cycMinPost < pre.lo - dist
+            s.sweepExt  := s.cycMinPost
+            s.sweepExtT := s.cycMinPostT
+
+        bool fibWaiting = useFib and s.state == ST_WAIT_ENTRY and s.fibEligible
+        // Ein bereits gesetztes Engulf-Limit bleibt wie das Fib-Limit bis zur Fib-Endzeit
+        // stehen. Neue Limits entstehen weiterhin nur im Entry-Fenster.
+        if t >= s.fibEndT
+            f_cancelEng(s, t)
+            f_cancelFiv(s, t)
+        if t >= s.fibEndT or (t >= s.entryEndT and not fibWaiting and not s.engArmed)
+            f_cancelFib(s, t)
+            s.state  := ST_CUTOFF
+            s.reason := t >= s.fibEndT ? s.tag + " fib end time reached - limit cancelled" : s.tag + " entry window closed - no new trades"
+        else if cnt.n >= s.maxTrades
+            f_cancelFib(s, t)
+            f_cancelEng(s, t)
+            f_cancelFiv(s, t)
+            s.state  := ST_MAX_TRADES
+            s.reason := "Max. " + s.tag + " trades reached"
+        else if t >= s.preEndT and (s.dir == -1 ? l <= pre.lo : h >= pre.hi)
+            f_invalidate(s, pre, t, s.tag + ": opposite side reached before entry")
+        else if s.state == ST_WAIT_ENTRY and s.fibArmed and t >= s.fibArmTime
+            if s.dir == -1 ? h >= s.fibLimit : l <= s.fibLimit
+                string pid = s.fibOrderId
+                bool ok = f_openTrade(s, pre, pre, trades, s.tag + " FIB", s.fibLimit, t, t + 60000)
+                if not ok
+                    f_cancelFib(s, t)
+                    if not na(pid)
+                        f_q("close", pid, 0, na, na, na, na, na, false, "blocked")
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 10b. ENTRY-MODELL 3: ASIA OB (eigenes Setup, ignoriert die Pre-Range)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+method resetAsiaCycle(AsiaSetup this, int startT) =>
+    if not na(this.obBox)
+        this.obBox.set_right(startT)
+    this.cycStart := startT
+    this.ext      := na
+    this.extT     := na
+    this.swept    := false
+    this.sweepLbl := na
+    this.obValid  := false
+    this.obHi     := na
+    this.obLo     := na
+    this.obBodyHi := na
+    this.obBodyLo := na
+    this.obTime   := na
+    this.obBox    := na
+    true
+
+f_asiaOpenTrade(AsiaSetup a, RangeObj asia, Counter cnt, array<Trade> trades, float entry, int entryT) =>
+    int   d    = a.dir
+    float buf  = asiaSlBuf / 100.0 * (asia.hi - asia.lo)
+    float sl   = d == -1 ? a.ext + buf : a.ext - buf
+    float risk = math.abs(entry - sl)
+    bool  dual = asiaTpMode == ATP_DUAL
+    float tpA  = d == -1 ? entry - asiaRR1 * risk : entry + asiaRR1 * risk
+    float tpB  = d == -1 ? entry - asiaRR2 * risk : entry + asiaRR2 * risk
+    float tp1  = dual ? tpA : tpB
+    bool  lvOk    = not na(sl) and risk > 0 and (d == -1 ? entry < sl : entry > sl)
+    float q       = lvOk ? f_calcQty(entry, sl) : na
+    bool  allowed = f_allowed(d, "ASIA")
+    bool  ntzA    = ntzAsia and f_inNoTradeZone(asia, entry)
+    bool  ok      = lvOk and allowed and not ntzA and not na(q) and q > 0
+    if ok
+        string id = f_newId("LEGACY ASIA OB", d)
+        // offene Fib-Limit des Pre-Setups in Gegenrichtung stornieren (keine Gegenpositionen)
+        if setup.fibArmed and setup.dir == -d
+            f_cancelFib(setup, entryT)
+        f_q("entry", id, d, q, na, na, na, na, false, "ASIA OB")
+        f_placeExits(id, dual, q, tp1, tpB, sl)
+        string r1 = str.tostring(asiaRR1) + "R"
+        string r2 = str.tostring(asiaRR2) + "R"
+        Trade tr = Trade.new(dir = d, model = "LEGACY ASIA OB", entry = entry, sl = sl, tp1 = tp1, tp2 = tpB, dual = dual, entryTime = entryT, checkFrom = entryT, id = id, qty = q, grp = "ASIA", closeT = f_closeTime("ASIA"), beOnTp1 = asiaBE, tp1Txt = "TP1 " + r1, tp2Txt = "TP2 " + r2)
+        f_drawTradeVisuals(tr, (d == 1 ? "A+ LONG ↑" : "A+ SHORT ↓") + "\nLEGACY ASIA OB")
+        string msg = (d == 1 ? "A+ LONG" : "A+ SHORT") + "\n" + syminfo.ticker + "\nAsia range sweep & OB reclaim" + "\nModell: ASIA OB\nConfirmation: M5 Close" + "\nEntry: " + f_px(entry) + "\nSL: " + f_px(sl) + (dual ? "\nTP1 (" + r1 + "): " + f_px(tp1) + "\nTP2 (" + r2 + "): " + f_px(tpB) : "\nTarget (" + r2 + "): " + f_px(tpB))
+        alert(msg, alert.freq_once_per_bar_close)
+        trades.push(tr)
+        cnt.n     := cnt.n + 1
+        a.sigTime := time
+        a.resetAsiaCycle(entryT)               // Re-Entry nur nach neuem Sweep
+        a.state   := cnt.n >= asiaMaxTrades ? AS_MAX_TRADES : AS_WAIT_SWEEP
+        a.reason  := "Asia trade " + str.tostring(cnt.n) + " opened" + (a.state == AS_WAIT_SWEEP ? " - waiting for a new sweep" : " - max. trades reached")
+    else
+        a.reason := ntzA ? "Entry blocked: no-trade zone 50 %" : not allowed ? "Entry blocked: " + f_blockReason("ASIA") : not lvOk ? "Entry rejected: invalid SL" : "Entry rejected: position size 0"
+    ok
+
+// pro M1-Intrabar: Aktivierung, Fenster-Ende, Sweep-Extrem, Invalidierung
+f_asiaStepIntrabar(AsiaSetup a, RangeObj asia, SessionTimes st, Counter cnt, int t, float h, float l) =>
+    if a.state == AS_WAIT_RANGE and asia.complete and t >= st.asiaEnd
+        a.state  := AS_WAIT_SWEEP
+        a.reason := "Waiting for sweep of the Asia " + (a.dir == -1 ? "high" : "low")
+    if a.state == AS_WAIT_SWEEP or a.state == AS_WAIT_RECLAIM
+        if cnt.n >= asiaMaxTrades
+            a.state  := AS_MAX_TRADES
+            a.reason := "Max. trades reached (Asia model)"
+        else if t >= st.asiaWinEnd
+            a.state  := AS_CUTOFF
+            a.reason := "Window closed - no new Asia trades"
+        else if t >= st.asiaWinStart and t >= st.asiaEnd and t >= a.cycStart
+            if na(a.ext) or (a.dir == -1 ? h > a.ext : l < a.ext)
+                a.ext  := a.dir == -1 ? h : l
+                a.extT := t
+            float dist = asiaSweepDist / 100.0 * (asia.hi - asia.lo)
+            a.swept := a.dir == -1 ? a.ext > asia.hi + dist : a.ext < asia.lo - dist
+            // Invalidierung: Gegenseite der Asia Range vor Entry erreicht
+            if a.dir == -1 ? l <= asia.lo : h >= asia.hi
+                a.resetAsiaCycle(t + 60000)
+                a.state         := AS_WAIT_SWEEP
+                a.invalidations := a.invalidations + 1
+                a.reason        := "Opposite side of the Asia range hit before entry - waiting for a new manipulation"
+                if showDebugLbl
+                    label.new(t, a.dir == -1 ? asia.lo : asia.hi, "ASIA INVALID", xloc = xloc.bar_time, style = a.dir == -1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+    true
+
+// pro M5-Close: OB, Sweep bestätigt, OB-Reclaim = Entry
+f_asiaStepBarClose(AsiaSetup a, RangeObj asia, SessionTimes st, Counter cnt, array<Trade> trades, float h, float l, float c, float o, int tOpen, int tClose) =>
+    if (a.state == AS_WAIT_SWEEP or a.state == AS_WAIT_RECLAIM) and tClose > st.asiaWinStart
+        int  d       = a.dir
+        bool inside  = c < asia.hi and c > asia.lo
+        bool outside = d == -1 ? c > asia.hi : c < asia.lo
+
+        // OB: erste Kerze des Zyklus, die außerhalb der Asia Range (Sweep-Seite) schließt
+        if not a.obValid and outside and tOpen >= a.cycStart
+            a.obValid  := true
+            a.obHi     := h
+            a.obLo     := l
+            a.obBodyHi := math.max(o, c)
+            a.obBodyLo := math.min(o, c)
+            a.obTime   := tOpen
+            if showOB
+                a.obBox := box.new(tOpen, a.obBodyHi, st.asiaWinEnd, a.obBodyLo, xloc = xloc.bar_time, bgcolor = colAsiaOB, border_color = color.new(colAsiaOB, 40), text = "ASIA OB", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+
+        // Sweep bestätigt
+        if a.state == AS_WAIT_SWEEP and a.swept
+            a.state  := AS_WAIT_RECLAIM
+            a.reason := "Asia sweep detected - waiting for OB reclaim"
+            if showSweep
+                a.sweepLbl := label.new(a.extT, a.ext, "SWEEP ASIA " + (d == -1 ? "HIGH" : "LOW"), xloc = xloc.bar_time, style = d == -1 ? label.style_label_down : label.style_label_up, color = colSweep, textcolor = color.white, size = size.small)
+        if not na(a.sweepLbl)
+            a.sweepLbl.set_xy(a.extT, a.ext)
+
+        // OB-Reclaim zurück in die Asia Range = Entry
+        if a.state == AS_WAIT_RECLAIM and tOpen < st.asiaWinEnd
+            float trig      = obTriggerInput == OB_WICK ? (d == -1 ? a.obLo : a.obHi) : (d == -1 ? a.obBodyLo : a.obBodyHi)
+            bool  obReclaim = a.obValid and a.obTime < tOpen and not na(trig) and (d == -1 ? c < trig : c > trig)
+            float rA        = asia.hi - asia.lo
+            float depth     = rA > 0 ? (d == -1 ? asia.hi - c : c - asia.lo) / rA * 100.0 : na
+            if a.swept and inside and obReclaim and not na(depth) and depth <= asiaObMaxDepth
+                if showReclaim
+                    label.new(tOpen, c, "ASIA RECLAIM", xloc = xloc.bar_time, style = d == -1 ? label.style_label_up : label.style_label_down, color = colReclaim, textcolor = color.white, size = size.tiny)
+                f_asiaOpenTrade(a, asia, cnt, trades, c, tClose)
+    true
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 11. MAIN
+// ═══════════════════════════════════════════════════════════════════════════════════════
+var SessionTimes sess       = na
+var bool         m1Seen     = false
+var AsiaSetup    legAsiaS  = AsiaSetup.new(dir = -1)
+var AsiaSetup    legAsiaL   = AsiaSetup.new(dir = 1)
+var Counter      asiaCnt    = Counter.new()
+
+// M1-Intrabars der aktuellen Chart-Kerze (kein lookahead, abgeschlossene Daten)
+[m1Time, m1High, m1Low, m1Close] = request.security_lower_tf(syminfo.tickerid, "1", [time, high, low, close])
+
+int   dayKey   = year(time, tzInput) * 10000 + month(time, tzInput) * 100 + dayofmonth(time, tzInput)
+bool  newDay   = dayKey != nz(dayKey[1])
+float prevHigh = high[1]
+float prevLow  = low[1]
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 10e. LIQUIDITÄTS-DETEKTOREN (globaler Scope, damit ta./request. konsistente Historie haben)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// --- Swing Highs / Lows: Fraktal mit swingLen Kerzen auf jeder Seite.
+//     Bestätigt erst swingLen Kerzen später – deshalb wird der Zeitstempel zurückdatiert.
+float pvH = ta.pivothigh(high, swingLen, swingLen)
+float pvL = ta.pivotlow(low, swingLen, swingLen)
+
+// --- FVGs je Timeframe (lookahead_off = kein Blick in die Zukunft)
+[m5L, m5H2, m5H, m5L2, m5T]      = request.security(syminfo.tickerid, "5",   [low, high[2], high, low[2], time], lookahead = barmerge.lookahead_off)
+[m15L, m15H2, m15H, m15L2, m15T] = request.security(syminfo.tickerid, "15",  [low, high[2], high, low[2], time], lookahead = barmerge.lookahead_off)
+[h1L, h1H2, h1H, h1L2, h1T]      = request.security(syminfo.tickerid, "60",  [low, high[2], high, low[2], time], lookahead = barmerge.lookahead_off)
+[h4L, h4H2, h4H, h4L2, h4T]      = request.security(syminfo.tickerid, "240", [low, high[2], high, low[2], time], lookahead = barmerge.lookahead_off)
+
+var array<int> fvgSeen = array.new<int>(4, 0)   // zuletzt verarbeitete HTF-Bar je Timeframe
+var Zone obBull = na
+var Zone obBear = na
+
+f_pushFvg(float lo0, float hi2, float hi0, float lo2, int t0, int slot, string tfName, bool on) =>
+    if on and t0 > fvgSeen.get(slot)
+        fvgSeen.set(slot, t0)
+        if lo0 > hi2                                   // bullischer FVG
+            Zone z = Zone.new(bot = hi2, top = lo0, dir = 1, t = t0, move = 1e12, seen = time, tf = tfName)
+            fvgs.push(z)
+            if showFvg
+                box.new(t0, z.top, t0 + 1, z.bot, xloc = xloc.bar_time, border_color = na, bgcolor = color.new(colBull, 85))
+        if hi0 < lo2                                   // bearischer FVG
+            Zone z = Zone.new(bot = hi0, top = lo2, dir = -1, t = t0, move = 1e12, seen = time, tf = tfName)
+            fvgs.push(z)
+            if showFvg
+                box.new(t0, z.top, t0 + 1, z.bot, xloc = xloc.bar_time, border_color = na, bgcolor = color.new(colBear, 85))
+    true
+
+if barstate.isconfirmed and time >= timestamp(tzInput, btStartY, btStartM, btStartD, 0, 0, 0)
+    // Swing-Levels einsammeln
+    if not na(pvH)
+        swHi.push(Lvl.new(px = pvH, t = time[swingLen]))
+        if swHi.size() > 60
+            swHi.shift()
+        if showSwings
+            line.new(time[swingLen], pvH, time, pvH, xloc = xloc.bar_time, color = color.new(colBear, 40), style = line.style_dotted)
+    if not na(pvL)
+        swLo.push(Lvl.new(px = pvL, t = time[swingLen]))
+        if swLo.size() > 60
+            swLo.shift()
+        if showSwings
+            line.new(time[swingLen], pvL, time, pvL, xloc = xloc.bar_time, color = color.new(colBull, 40), style = line.style_dotted)
+
+    // FVGs einsammeln (FVG-Filter aus = gar nichts sammeln, spart Objekte)
+    if useFvgFilter or showFvg or useFiv
+        f_pushFvg(m5L,  m5H2,  m5H,  m5L2,  m5T,  0, "M5",  fvgM5)
+        f_pushFvg(m15L, m15H2, m15H, m15L2, m15T, 1, "M15", fvgM15)
+        f_pushFvg(h1L,  h1H2,  h1H,  h1L2,  h1T,  2, "H1",  fvgH1)
+        f_pushFvg(h4L,  h4H2,  h4H,  h4L2,  h4T,  3, "H4",  fvgH4)
+        // vollständig durchhandelte FVGs verfallen
+        for z in fvgs
+            if not z.dead and (z.dir == 1 ? low < z.bot : high > z.top)
+                z.dead := true
+            // Inversion: Close jenseits der gegenüberliegenden Kante dreht die Rolle um
+            if not z.inv and (z.dir == 1 ? close < z.bot : close > z.top)
+                z.inv  := true
+                z.invT := time
+        while fvgs.size() > 120
+            fvgs.shift()
+
+    // Orderblocks: letzte Down-Kerze vor Upmove / letzte Up-Kerze vor Downmove.
+    // Der Impuls wird laufend mitgemessen – kein Blick in die Zukunft.
+    if useObFilter
+        if not na(obBull)
+            obBull.move := math.max(obBull.move, high - obBull.anchor)
+        if not na(obBear)
+            obBear.move := math.max(obBear.move, obBear.anchor - low)
+        if close < open
+            obBull := Zone.new(bot = low, top = high, dir = 1, t = time, move = 0.0, anchor = low)
+            obz.push(obBull)
+        if close > open
+            obBear := Zone.new(bot = low, top = high, dir = -1, t = time, move = 0.0, anchor = high)
+            obz.push(obBear)
+        while obz.size() > obLookback * 2
+            obz.shift()
+
+bool inBacktest = time >= timestamp(tzInput, btStartY, btStartM, btStartD, 0, 0, 0)
+bool tfOK       = timeframe.isminutes and timeframe.multiplier <= 15
+
+if barstate.isconfirmed and inBacktest and tfOK
+    // --- Tages-Reset (00:00 Ortszeit). Offene Trades bleiben bestehen.
+    if newDay or na(sess)
+        sess  := f_buildSessionTimes(time)
+        setup := Setup.new(state = ST_BUILD_ASIA, cycStart = sess.asiaEnd, reason = "Building Asia range", tag = "LEGACY LONDON", isNY = false, preEndT = sess.preEnd, entryStartT = sess.preEnd, entryEndT = sess.cutoff, maxTrades = maxTradesInput, fibEndT = math.max(sess.ldnFibEnd, sess.cutoff), grp = "LDN", cnt = ldnCnt, swDistPct = ldnSweepDist, obDepthPct = obMaxDepth, fibDepthPct = fibMinDepth)
+        asiaR := RangeObj.new()
+        preR  := RangeObj.new()
+        legAsiaS := AsiaSetup.new(dir = -1, cycStart = sess.asiaWinStart)
+        legAsiaL  := AsiaSetup.new(dir = 1,  cycStart = sess.asiaWinStart)
+        asiaCnt.n := 0
+        flushDone.set(0, false)
+        flushDone.set(1, false)
+        flushDone.set(2, false)
+        sessCloseT.set(0, sess.asiaCloseT)
+        sessCloseT.set(1, sess.ldnCloseT)
+        sessCloseT.set(2, sess.lunchCloseT)
+        sessCloseT.set(3, sess.nyCloseT)
+        dayState.slN       := 0
+        dayState.tpN       := 0
+        dayState.lockAsia  := false
+        dayState.lockLdn   := false
+        dayState.lockLunch := false
+        dayState.lockNy    := false
+        ldnCnt.n   := 0
+        nyCnt.n    := 0
+        lunchCnt.n := 0
+        lunchR   := RangeObj.new()
+        lunchShort := Setup.new(dir = -1, state = ST_BUILD_PRE, cycStart = sess.lunchPreEnd, reason = "Building lunch range", tag = "LUNCH", isNY = true, grp = "LUNCH", cnt = lunchCnt, preEndT = sess.lunchPreEnd, entryStartT = sess.lunchEntryStart, entryEndT = sess.lunchEntryEnd, maxTrades = lunchMaxTrades, fibEndT = math.max(sess.lunchFibEnd, sess.lunchEntryEnd), swDistPct = lunchSweepDist, obDepthPct = lunchObDepth, fibDepthPct = lunchFibDepth)
+        lunchLong  := Setup.new(dir = 1,  state = ST_BUILD_PRE, cycStart = sess.lunchPreEnd, reason = "Building lunch range", tag = "LUNCH", isNY = true, grp = "LUNCH", cnt = lunchCnt, preEndT = sess.lunchPreEnd, entryStartT = sess.lunchEntryStart, entryEndT = sess.lunchEntryEnd, maxTrades = lunchMaxTrades, fibEndT = math.max(sess.lunchFibEnd, sess.lunchEntryEnd), swDistPct = lunchSweepDist, obDepthPct = lunchObDepth, fibDepthPct = lunchFibDepth)
+        nyPreR  := RangeObj.new()
+        nyShort := Setup.new(dir = -1, state = ST_BUILD_PRE, cycStart = sess.nyPreEnd, reason = "Building NY pre-range", tag = "NY", isNY = true, grp = "NY", cnt = nyCnt, preEndT = sess.nyPreEnd, entryStartT = sess.nyEntryStart, entryEndT = sess.nyEntryEnd, maxTrades = nyMaxTrades, fibEndT = math.max(sess.nyFibEnd, sess.nyEntryEnd), swDistPct = nySweepDist, obDepthPct = nyObDepth, fibDepthPct = nyFibDepth)
+        nyLong  := Setup.new(dir = 1,  state = ST_BUILD_PRE, cycStart = sess.nyPreEnd, reason = "Building NY pre-range", tag = "NY", isNY = true, grp = "NY", cnt = nyCnt, preEndT = sess.nyPreEnd, entryStartT = sess.nyEntryStart, entryEndT = sess.nyEntryEnd, maxTrades = nyMaxTrades, fibEndT = math.max(sess.nyFibEnd, sess.nyEntryEnd), swDistPct = nySweepDist, obDepthPct = nyObDepth, fibDepthPct = nyFibDepth)
+        // --- Asia und London laufen ab V1.6 nach denselben Regeln wie Lunch und NY ---
+        asiaS := Setup.new(dir = -1, state = ST_BUILD_PRE, cycStart = sess.asiaEnd, reason = "Building Asia range", tag = "ASIA", isNY = true, grp = "ASIA", cnt = asiaCnt, preEndT = sess.asiaEnd, entryStartT = sess.asiaEntryStart, entryEndT = sess.asiaEntryEnd, maxTrades = asiaMaxTrades, fibEndT = math.max(sess.asiaFibEnd, sess.asiaEntryEnd), swDistPct = sweepDistPct, obDepthPct = asiaObDepth, fibDepthPct = asiaFibDepth)
+        asiaL := Setup.new(dir = 1,  state = ST_BUILD_PRE, cycStart = sess.asiaEnd, reason = "Building Asia range", tag = "ASIA", isNY = true, grp = "ASIA", cnt = asiaCnt, preEndT = sess.asiaEnd, entryStartT = sess.asiaEntryStart, entryEndT = sess.asiaEntryEnd, maxTrades = asiaMaxTrades, fibEndT = math.max(sess.asiaFibEnd, sess.asiaEntryEnd), swDistPct = sweepDistPct, obDepthPct = asiaObDepth, fibDepthPct = asiaFibDepth)
+        ldnS  := Setup.new(dir = -1, state = ST_BUILD_PRE, cycStart = sess.preEnd, reason = "Building London range", tag = "LONDON", isNY = true, grp = "LDN", cnt = ldnCnt, preEndT = sess.preEnd, entryStartT = sess.ldnEntryStart, entryEndT = sess.ldnEntryEnd, maxTrades = maxTradesInput, fibEndT = math.max(sess.ldnFibEnd, sess.ldnEntryEnd), swDistPct = ldnSweepDist, obDepthPct = ldnObDepth, fibDepthPct = ldnFibDepth)
+        ldnL  := Setup.new(dir = 1,  state = ST_BUILD_PRE, cycStart = sess.preEnd, reason = "Building London range", tag = "LONDON", isNY = true, grp = "LDN", cnt = ldnCnt, preEndT = sess.preEnd, entryStartT = sess.ldnEntryStart, entryEndT = sess.ldnEntryEnd, maxTrades = maxTradesInput, fibEndT = math.max(sess.ldnFibEnd, sess.ldnEntryEnd), swDistPct = ldnSweepDist, obDepthPct = ldnObDepth, fibDepthPct = ldnFibDepth)
+        fivACnt.n := 0
+        fivLCnt.n := 0
+        fivLuCnt.n := 0
+        fivNCnt.n := 0
+        asiaS.fivCnt := fivOwnMax > 0 ? fivACnt : asiaCnt
+        asiaL.fivCnt := fivOwnMax > 0 ? fivACnt : asiaCnt
+        ldnS.fivCnt  := fivOwnMax > 0 ? fivLCnt : ldnCnt
+        ldnL.fivCnt  := fivOwnMax > 0 ? fivLCnt : ldnCnt
+        lunchShort.fivCnt := fivOwnMax > 0 ? fivLuCnt : lunchCnt
+        lunchLong.fivCnt  := fivOwnMax > 0 ? fivLuCnt : lunchCnt
+        nyShort.fivCnt := fivOwnMax > 0 ? fivNCnt : nyCnt
+        nyLong.fivCnt  := fivOwnMax > 0 ? fivNCnt : nyCnt
+        engACnt.n := 0
+        engLCnt.n := 0
+        engLuCnt.n := 0
+        engNCnt.n := 0
+        asiaS.engCnt := engOwnMax > 0 ? engACnt : asiaCnt
+        asiaL.engCnt := engOwnMax > 0 ? engACnt : asiaCnt
+        ldnS.engCnt  := engOwnMax > 0 ? engLCnt : ldnCnt
+        ldnL.engCnt  := engOwnMax > 0 ? engLCnt : ldnCnt
+        lunchShort.engCnt := engOwnMax > 0 ? engLuCnt : lunchCnt
+        lunchLong.engCnt  := engOwnMax > 0 ? engLuCnt : lunchCnt
+        nyShort.engCnt := engOwnMax > 0 ? engNCnt : nyCnt
+        nyLong.engCnt  := engOwnMax > 0 ? engNCnt : nyCnt
+
+    int n = m1Time.size()
+    // Unvollständiger erster Tag (Beginn der M1-Historie mitten in der Asia-Session)
+    if n > 0 and not m1Seen
+        m1Seen := true
+        if m1Time.first() > sess.asiaStart + 60000 and setup.state == ST_BUILD_ASIA
+            setup.state  := ST_NO_DATA
+            setup.reason := "M1 history starts mid-day"
+
+    if n > 0
+        for i = 0 to n - 1
+            int   ti = m1Time.get(i)
+            float th = m1High.get(i)
+            float tl = m1Low.get(i)
+            float tc = m1Close.get(i)
+
+            // 1) offene Trades (auch vom Vortag) zuerst
+            f_manageTrades(openTrades, ti, th, tl, tc)
+
+            // 1b) optional: neue Session raeumt aeltere Sessions ab, damit deren
+            //     Restbestand keine Gegensignale mehr blockiert
+            if flattenPrev
+                if ti >= sess.ldnEntryStart and not flushDone.get(0)
+                    flushDone.set(0, true)
+                    f_flushGroup(openTrades, "ASIA", ti, tc)
+                    f_cancelFib(asiaS, ti)
+                    f_cancelFib(asiaL, ti)
+                if ti >= sess.lunchEntryStart and not flushDone.get(1)
+                    flushDone.set(1, true)
+                    f_flushGroup(openTrades, "ASIA", ti, tc)
+                    f_flushGroup(openTrades, "LDN", ti, tc)
+                    f_cancelFib(asiaS, ti)
+                    f_cancelFib(asiaL, ti)
+                    f_cancelFib(ldnS, ti)
+                    f_cancelFib(ldnL, ti)
+                    f_cancelFib(setup, ti)
+                if ti >= sess.nyEntryStart and not flushDone.get(2)
+                    flushDone.set(2, true)
+                    f_flushGroup(openTrades, "ASIA", ti, tc)
+                    f_flushGroup(openTrades, "LDN", ti, tc)
+                    f_flushGroup(openTrades, "LUNCH", ti, tc)
+                    f_cancelFib(lunchShort, ti)
+                    f_cancelFib(lunchLong, ti)
+
+            // 2) alle vier Ranges bilden – unabhängig davon, welches Setup aktiv ist
+            if ti >= sess.asiaStart and ti < sess.asiaEnd
+                asiaR.update(th, tl)
+            else if ti >= sess.asiaEnd and asiaR.bars > 0
+                asiaR.complete := true
+            if ti >= sess.preStart and ti < sess.preEnd
+                preR.update(th, tl)
+            else if ti >= sess.preEnd and preR.bars > 0
+                preR.complete := true
+            if ti >= sess.lunchPreStart and ti < sess.lunchPreEnd
+                lunchR.update(th, tl)
+            if ti >= sess.nyPreStart and ti < sess.nyPreEnd
+                nyPreR.update(th, tl)
+
+            // 3) die vier eigenständigen Range-Setups
+            if useAsia
+                f_rangeStepIntrabar(asiaS, asiaR, asiaCnt, openTrades, ti, th, tl)
+                f_rangeStepIntrabar(asiaL, asiaR, asiaCnt, openTrades, ti, th, tl)
+            if useLdn
+                f_rangeStepIntrabar(ldnS, preR, ldnCnt, openTrades, ti, th, tl)
+                f_rangeStepIntrabar(ldnL, preR, ldnCnt, openTrades, ti, th, tl)
+            if useLunch
+                f_rangeStepIntrabar(lunchShort, lunchR, lunchCnt, openTrades, ti, th, tl)
+                f_rangeStepIntrabar(lunchLong,  lunchR, lunchCnt, openTrades, ti, th, tl)
+            if useNY
+                f_rangeStepIntrabar(nyShort, nyPreR, nyCnt, openTrades, ti, th, tl)
+                f_rangeStepIntrabar(nyLong,  nyPreR, nyCnt, openTrades, ti, th, tl)
+
+            // 4) Legacy-Setups
+            if useLegLdn
+                f_stepIntrabar(setup, asiaR, preR, sess, openTrades, ti, th, tl)
+            if useAsiaOB
+                f_asiaStepIntrabar(legAsiaS, asiaR, sess, asiaCnt, ti, th, tl)
+                f_asiaStepIntrabar(legAsiaL, asiaR, sess, asiaCnt, ti, th, tl)
+
+    if showAsia
+        f_drawRange(asiaR, sess.asiaStart, sess.asiaEnd, useAsia ? sess.asiaEntryEnd : sess.asiaEnd, colAsiaFill, colAsiaLine, "ASIA", showPreLines and useAsia)
+    if showPre
+        f_drawRange(preR, sess.preStart, sess.preEnd, useLdn ? sess.ldnEntryEnd : sess.cutoff, colPreFill, colPreLine, "LONDON", showPreLines)
+    if useLunch and showPre
+        f_drawRange(lunchR, sess.lunchPreStart, sess.lunchPreEnd, sess.lunchEntryEnd, colLunchFill, colLunchLine, "LUNCH", showPreLines)
+    if useNY and showPre
+        f_drawRange(nyPreR, sess.nyPreStart, sess.nyPreEnd, sess.nyEntryEnd, colNyFill, colNyLine, "NY", showPreLines)
+
+    // --- Modell 3: Drei-Kerzen-Engulfing (unabhängig von der Sweep/Reclaim-Maschine)
+    if useEng
+        // Three white soldiers / three black crows: drei starke Kerzen derselben Richtung
+        // direkt hintereinander. Eine schwache Kerze MITTEN in der Serie bricht sie ab.
+        // Schwache Kerzen VOR der Serie werden beim Blick zurück übersprungen.
+        int  cd0 = f_cdir(0)
+        int  cd1 = f_cdir(1)
+        int  cd2 = f_cdir(2)
+        bool trioRaw = cd0 != 0 and cd0 == cd1 and cd1 == cd2
+        int  prevDir = 0
+        if trioRaw
+            for i = 3 to 14
+                int di = f_cdir(i)
+                if di != 0 and prevDir == 0
+                    prevDir := di
+        bool bearNow = cd0 == -1
+        bool bullNow = cd0 == 1
+        bool engExact = engSeries == "Exactly three candles"
+        bool bear3 = trioRaw and cd0 == -1 and (not engExact or prevDir != -1)
+        bool bull3 = trioRaw and cd0 ==  1 and (not engExact or prevDir !=  1)
+        float t3Lo     = math.min(low,  math.min(low[1],  low[2]))
+        float t3Hi     = math.max(high, math.max(high[1], high[2]))
+        float t3BodyHi = math.max(math.max(open, close), math.max(math.max(open[1], close[1]), math.max(open[2], close[2])))
+        float t3BodyLo = math.min(math.min(open, close), math.min(math.min(open[1], close[1]), math.min(open[2], close[2])))
+        float t3LastHi = math.max(open, close)
+        float t3LastLo = math.min(open, close)
+        bool  asiaWin  = time_close > sess.asiaEntryStart and time < sess.asiaEntryEnd
+        bool  ldnWin   = time_close > sess.ldnEntryStart and time < sess.ldnEntryEnd
+        bool  lunWin   = time_close > sess.lunchEntryStart and time < sess.lunchEntryEnd
+        bool  nyWin    = time_close > sess.nyEntryStart and time < sess.nyEntryEnd
+        if useAsia
+            f_engulfStep(asiaL, asiaR, asiaCnt, openTrades, bear3, t3Lo, t3Hi, t3BodyHi, t3LastHi, bearNow, close, low, high, time, time_close, asiaWin)
+            f_engulfStep(asiaS, asiaR, asiaCnt, openTrades, bull3, t3Hi, t3Lo, t3BodyLo, t3LastLo, bullNow, close, low, high, time, time_close, asiaWin)
+        if useLdn
+            f_engulfStep(ldnL, preR, ldnCnt, openTrades, bear3, t3Lo, t3Hi, t3BodyHi, t3LastHi, bearNow, close, low, high, time, time_close, ldnWin)
+            f_engulfStep(ldnS, preR, ldnCnt, openTrades, bull3, t3Hi, t3Lo, t3BodyLo, t3LastLo, bullNow, close, low, high, time, time_close, ldnWin)
+        if useLunch
+            f_engulfStep(lunchLong,  lunchR, lunchCnt, openTrades, bear3, t3Lo, t3Hi, t3BodyHi, t3LastHi, bearNow, close, low, high, time, time_close, lunWin)
+            f_engulfStep(lunchShort, lunchR, lunchCnt, openTrades, bull3, t3Hi, t3Lo, t3BodyLo, t3LastLo, bullNow, close, low, high, time, time_close, lunWin)
+        if useNY
+            f_engulfStep(nyLong,  nyPreR, nyCnt, openTrades, bear3, t3Lo, t3Hi, t3BodyHi, t3LastHi, bearNow, close, low, high, time, time_close, nyWin)
+            f_engulfStep(nyShort, nyPreR, nyCnt, openTrades, bull3, t3Hi, t3Lo, t3BodyLo, t3LastLo, bullNow, close, low, high, time, time_close, nyWin)
+
+    // --- die vier eigenständigen Range-Setups
+    if useAsia
+        f_stepBarClose(asiaS, asiaR, asiaR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+        f_stepBarClose(asiaL, asiaR, asiaR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+    if useLdn
+        f_stepBarClose(ldnS, preR, preR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+        f_stepBarClose(ldnL, preR, preR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+    if useLunch
+        f_stepBarClose(lunchShort, lunchR, lunchR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+        f_stepBarClose(lunchLong,  lunchR, lunchR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+    if useNY
+        f_stepBarClose(nyShort, nyPreR, nyPreR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+        f_stepBarClose(nyLong,  nyPreR, nyPreR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+    // --- Modell 4: FVG-Inversion
+    if useFiv
+        bool aW = time_close > sess.asiaEntryStart and time < sess.asiaEntryEnd
+        bool lW = time_close > sess.ldnEntryStart and time < sess.ldnEntryEnd
+        bool uW = time_close > sess.lunchEntryStart and time < sess.lunchEntryEnd
+        bool nW = time_close > sess.nyEntryStart and time < sess.nyEntryEnd
+        if useAsia
+            f_fivStep(asiaL, asiaR, asiaCnt, openTrades, close, time, time_close, aW)
+            f_fivStep(asiaS, asiaR, asiaCnt, openTrades, close, time, time_close, aW)
+        if useLdn
+            f_fivStep(ldnL, preR, ldnCnt, openTrades, close, time, time_close, lW)
+            f_fivStep(ldnS, preR, ldnCnt, openTrades, close, time, time_close, lW)
+        if useLunch
+            f_fivStep(lunchLong, lunchR, lunchCnt, openTrades, close, time, time_close, uW)
+            f_fivStep(lunchShort, lunchR, lunchCnt, openTrades, close, time, time_close, uW)
+        if useNY
+            f_fivStep(nyLong, nyPreR, nyCnt, openTrades, close, time, time_close, nW)
+            f_fivStep(nyShort, nyPreR, nyCnt, openTrades, close, time, time_close, nW)
+
+    // --- Legacy-Setups
+    if useLegLdn
+        f_stepBarClose(setup, asiaR, preR, sess, openTrades, high, low, close, open, prevHigh, prevLow, time, time_close)
+    if useAsiaOB
+        f_asiaStepBarClose(legAsiaS, asiaR, sess, asiaCnt, openTrades, high, low, close, open, time, time_close)
+        f_asiaStepBarClose(legAsiaL, asiaR, sess, asiaCnt, openTrades, high, low, close, open, time, time_close)
+
+    // offene Trade-Boxen bis zur aktuellen Kerze verlängern
+    if openTrades.size() > 0
+        for tr in openTrades
+            if not na(tr.riskBox)
+                tr.riskBox.set_right(time_close)
+            if not na(tr.rewardBox)
+                tr.rewardBox.set_right(time_close)
+            if not na(tr.tp1Line)
+                tr.tp1Line.set_x2(time_close)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 11b. ORDER-QUEUE AUSFÜHREN (globaler Scope – hier entstehen die echten Orders)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+if orderQ.size() > 0
+    for i = 0 to orderQ.size() - 1
+        OrderReq o = orderQ.get(i)
+        // Sicherheitsnetz: ohne gültige Menge würde strategy.entry den Aufruf still verwerfen
+        float qq = na(o.qty) or o.qty <= 0 ? 1.0 : o.qty
+        if o.kind == "entry"
+            strategy.entry(o.id, o.dir == 1 ? strategy.long : strategy.short, qty = qq, comment = o.comment)
+            qStat.set(2, qStat.get(2) + 1)
+        else if o.kind == "limit"
+            strategy.entry(o.id, o.dir == 1 ? strategy.long : strategy.short, qty = qq, limit = o.price, comment = o.comment)
+            qStat.set(2, qStat.get(2) + 1)
+        else if o.kind == "exits"
+            float q1 = o.dual ? f_tp1Qty(qq) : 0.0
+            if o.dual and q1 > 0
+                strategy.exit(o.id + " TP1", from_entry = o.id, qty = q1,      limit = o.tp1, stop = o.sl, comment_profit = "TP1", comment_loss = "SL")
+                // KEIN qty: das zweite Bein deckt die gesamte Restmenge ab. Mit fester Menge
+                // bleibt bei abweichender Rundung der Entry-Größe ein Rest ohne Exit offen.
+                strategy.exit(o.id + " TP2", from_entry = o.id, limit = o.tp2, stop = o.sl, comment_profit = "TP2", comment_loss = "SL")
+            else if o.dual
+                strategy.exit(o.id + " TP2", from_entry = o.id, limit = o.tp2, stop = o.sl, comment_profit = "TP2", comment_loss = "SL")
+            else
+                strategy.exit(o.id + " TP", from_entry = o.id, limit = o.tp1, stop = o.sl, comment_profit = "TP", comment_loss = "SL")
+        else if o.kind == "be"
+            strategy.exit(o.id + " TP2", from_entry = o.id, limit = o.tp2, stop = o.sl, comment_profit = "TP2", comment_loss = "BE")
+        else if o.kind == "cancel"
+            strategy.cancel(o.id)
+        else if o.kind == "close"
+            strategy.close(o.id, comment = o.comment)
+    orderQ.clear()
+
+// --- Sicherheitsnetz: Position ohne internen Trade-Datensatz (Rundungsrest) ---------------
+var array<int> orphanN = array.new<int>(1, 0)
+if barstate.isconfirmed and inBacktest and tfOK and flattenOrph
+    if openTrades.size() == 0 and strategy.position_size != 0
+        orphanN.set(0, orphanN.get(0) + 1)
+        if orphanN.get(0) >= 2
+            strategy.close_all(comment = "orphan flatten")
+            orphanN.set(0, 0)
+    else
+        orphanN.set(0, 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 12. SIGNALE / ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════════════
+bool asiaLongSignal  = barstate.isconfirmed and asiaL.sigTime == time
+bool asiaShortSignal = barstate.isconfirmed and asiaS.sigTime == time
+plotshape(asiaLongSignal,  "ASIA LONG",  shape.triangleup,   location.belowbar, colBull, size = size.tiny, display = display.data_window)
+plotshape(asiaShortSignal, "ASIA SHORT", shape.triangledown, location.abovebar, colBear, size = size.tiny, display = display.data_window)
+alertcondition(asiaLongSignal,  "A+ ASIA LONG",  "A+ LONG | {{ticker}} | Asia range sweep & reclaim | Close {{close}}")
+alertcondition(asiaShortSignal, "A+ ASIA SHORT", "A+ SHORT | {{ticker}} | Asia range sweep & reclaim | Close {{close}}")
+
+bool ldnLongSignal  = barstate.isconfirmed and ldnL.sigTime == time
+bool ldnShortSignal = barstate.isconfirmed and ldnS.sigTime == time
+plotshape(ldnLongSignal,  "LONDON LONG",  shape.triangleup,   location.belowbar, colBull, size = size.tiny, display = display.data_window)
+plotshape(ldnShortSignal, "LONDON SHORT", shape.triangledown, location.abovebar, colBear, size = size.tiny, display = display.data_window)
+alertcondition(ldnLongSignal,  "A+ LONDON LONG",  "A+ LONG | {{ticker}} | London range sweep & reclaim | Close {{close}}")
+alertcondition(ldnShortSignal, "A+ LONDON SHORT", "A+ SHORT | {{ticker}} | London range sweep & reclaim | Close {{close}}")
+
+bool longSignal  = barstate.isconfirmed and setup.sigTime == time and setup.sigDir == 1
+bool shortSignal = barstate.isconfirmed and setup.sigTime == time and setup.sigDir == -1
+
+plotshape(longSignal,  "A+ LONG",  shape.triangleup,   location.belowbar, colBull, size = size.tiny, display = display.data_window)
+plotshape(shortSignal, "A+ SHORT", shape.triangledown, location.abovebar, colBear, size = size.tiny, display = display.data_window)
+
+bool legAsiaLSignal  = barstate.isconfirmed and legAsiaL.sigTime == time
+bool legAsiaSSignal = barstate.isconfirmed and legAsiaS.sigTime == time
+plotshape(legAsiaLSignal,  "ASIA OB LONG",  shape.triangleup,   location.belowbar, colBull, size = size.tiny, display = display.data_window)
+plotshape(legAsiaSSignal, "ASIA OB SHORT", shape.triangledown, location.abovebar, colBear, size = size.tiny, display = display.data_window)
+
+bool nyLongSignal  = barstate.isconfirmed and nyLong.sigTime == time
+bool nyShortSignal = barstate.isconfirmed and nyShort.sigTime == time
+plotshape(nyLongSignal,  "NY LONG",  shape.triangleup,   location.belowbar, colBull, size = size.tiny, display = display.data_window)
+plotshape(nyShortSignal, "NY SHORT", shape.triangledown, location.abovebar, colBear, size = size.tiny, display = display.data_window)
+alertcondition(nyLongSignal,  "A+ NY LONG",  "A+ LONG | {{ticker}} | NY Pre-Range Sweep & Reclaim | Close {{close}}")
+bool lunchLongSignal  = barstate.isconfirmed and lunchLong.sigTime == time
+bool lunchShortSignal = barstate.isconfirmed and lunchShort.sigTime == time
+plotshape(lunchLongSignal,  "LUNCH LONG",  shape.triangleup,   location.belowbar, colBull, size = size.tiny, display = display.data_window)
+plotshape(lunchShortSignal, "LUNCH SHORT", shape.triangledown, location.abovebar, colBear, size = size.tiny, display = display.data_window)
+alertcondition(lunchLongSignal,  "A+ LUNCH LONG",  "A+ LONG | {{ticker}} | Lunch-Range Sweep & Reclaim | Close {{close}}")
+alertcondition(lunchShortSignal, "A+ LUNCH SHORT", "A+ SHORT | {{ticker}} | Lunch-Range Sweep & Reclaim | Close {{close}}")
+alertcondition(nyShortSignal, "A+ NY SHORT", "A+ SHORT | {{ticker}} | NY Pre-Range Sweep & Reclaim | Close {{close}}")
+
+// Detaillierte Alerts (Entry/SL/TP) kommen über alert() → Alarm mit "Any alert() function call" anlegen.
+alertcondition(longSignal,  "A+ LEGACY LONDON LONG",  "A+ LONG | {{ticker}} | Legacy London model | Close {{close}}")
+alertcondition(legAsiaLSignal,  "A+ LEGACY ASIA OB LONG",  "A+ LONG | {{ticker}} | Legacy Asia OB model | Close {{close}}")
+alertcondition(legAsiaSSignal, "A+ LEGACY ASIA OB SHORT", "A+ SHORT | {{ticker}} | Legacy Asia OB model | Close {{close}}")
+alertcondition(shortSignal, "A+ LEGACY LONDON SHORT", "A+ SHORT | {{ticker}} | Legacy London model | Close {{close}}")
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// 13. DEBUG
+// ═══════════════════════════════════════════════════════════════════════════════════════
+f_openList() =>
+    string o = ""
+    for tr in openTrades
+        o := o + (o == "" ? "" : ", ") + tr.grp + " " + (tr.dir == 1 ? "LONG" : "SHORT") + " @" + f_px(tr.entry) + " (" + tr.model + ")"
+    o == "" ? "none" : o
+
+f_exitTimes() =>
+    string o = ""
+    for i = 0 to 3
+        string nm = i == 0 ? "A" : i == 1 ? "L" : i == 2 ? "Lu" : "NY"
+        o := o + (i == 0 ? "" : " ") + nm + " " + (sessCloseT.get(i) > 0 ? str.format_time(sessCloseT.get(i), "HH:mm", tzInput) : "-")
+    o
+
+f_short(int st) =>
+    switch st
+        ST_WAIT_SWEEP   => "SWEEP?"
+        ST_WAIT_RECLAIM => "RECL?"
+        ST_WAIT_ENTRY   => "ENTRY?"
+        ST_CUTOFF       => "END"
+        ST_MAX_TRADES   => "MAX"
+        ST_INVALID_LOC  => "LOC x"
+        ST_NO_DATA      => "NO DATA"
+        ST_BUILD_ASIA   => "…"
+        ST_BUILD_PRE    => "…"
+        => "–"
+
+f_c(table tb, int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color = color.new(color.white, 35), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = vc, text_size = size.tiny, text_halign = text.align_left)
+
+if showDebug and barstate.islast
+    var table cp = table.new(dbgPosInput, 2, 14, bgcolor = color.new(#131722, 25), border_color = color.new(color.gray, 85), border_width = 1)
+    f_c(cp, 0, "Lou-A+ 1.96", str.format_time(time, "dd.MM HH:mm", tzInput) + (timeframe.period == "5" ? "" : " !" + timeframe.period), color.new(#b2b5be, 0))
+    f_c(cp, 1, "ASIA",   useAsia  ? "S " + f_short(asiaS.state) + " | L " + f_short(asiaL.state) + " · " + str.tostring(asiaCnt.n) + "/" + str.tostring(asiaMaxTrades) : "off", colAsiaLine)
+    f_c(cp, 2, "LONDON", useLdn   ? "S " + f_short(ldnS.state)  + " | L " + f_short(ldnL.state)  + " · " + str.tostring(ldnCnt.n) + "/" + str.tostring(maxTradesInput) : "off", colPreLine)
+    f_c(cp, 3, "LUNCH",  useLunch ? "S " + f_short(lunchShort.state) + " | L " + f_short(lunchLong.state) + " · " + str.tostring(lunchCnt.n) + "/" + str.tostring(lunchMaxTrades) : "off", colLunchLine)
+    f_c(cp, 4, "NY",     useNY    ? "S " + f_short(nyShort.state) + " | L " + f_short(nyLong.state) + " · " + str.tostring(nyCnt.n) + "/" + str.tostring(nyMaxTrades) : "off", colNyLine)
+    f_c(cp, 5, "Locks", (dayState.lockAsia ? "A " : "") + (dayState.lockLdn ? "L " : "") + (dayState.lockLunch ? "Lu " : "") + (dayState.lockNy ? "NY " : "") + (dayState.lockAsia or dayState.lockLdn or dayState.lockLunch or dayState.lockNy ? "🔒" : "none"), color.new(color.white, 20))
+    f_c(cp, 6, "Queue", (tfOK ? "" : "TF! ") + "entry " + str.tostring(qStat.get(1)) + " · exec " + str.tostring(qStat.get(2)) + " · Qty " + str.tostring(qLast.get(0), "#.##") + " · value " + str.tostring(nz(qLast.get(0)) * close * syminfo.pointvalue, "#") + " / Eq " + str.tostring(strategy.equity, "#"), color.new(#ffab00, 0))
+    f_c(cp, 7, "Orders", "exit " + f_exitTimes() + " · closed " + str.tostring(strategy.closedtrades) + " · open " + str.tostring(strategy.opentrades) + " · pos " + str.tostring(strategy.position_size), color.new(color.white, 20))
+    f_c(cp, 12, "Open now", f_openList(), color.new(#ffab00, 0))
+    f_c(cp, 8, "3C", useEng ?
+          "A " + (asiaS.engArmed or asiaL.engArmed ? "LIMIT" : asiaS.trioValid or asiaL.trioValid ? "ok" : "-") +
+          " · L " + (ldnS.engArmed or ldnL.engArmed ? "LIMIT" : ldnS.trioValid or ldnL.trioValid ? "ok" : "-") +
+          " · Lu " + (lunchShort.engArmed or lunchLong.engArmed ? "LIMIT" : lunchShort.trioValid or lunchLong.trioValid ? "ok" : "-") +
+          " · NY " + (nyShort.engArmed or nyLong.engArmed ? "LIMIT" : nyShort.trioValid or nyLong.trioValid ? "ok" : "-") : "off", colSweep)
+    f_c(cp, 9, "3C last", useEng ? engMsg.get(0) : "-", colSweep)
+    f_c(cp, 10, "Legacy", useAsiaOB or useLegLdn ? (useAsiaOB ? "AsiaOB " + f_short(legAsiaS.state == AS_WAIT_RECLAIM or legAsiaL.state == AS_WAIT_RECLAIM ? ST_WAIT_RECLAIM : ST_WAIT_SWEEP) + " " : "") + (useLegLdn ? "London " + f_short(setup.state) : "") : "off", color.new(color.white, 40))
+    // Status zeigt die Session, deren State am weitesten fortgeschritten ist
+    int    bestSt  = -1
+    string bestTxt = "-"
+    if useAsia and asiaS.state  > bestSt
+        bestSt := asiaS.state
+        bestTxt := "ASIA S: " + asiaS.reason
+    if useAsia and asiaL.state  > bestSt
+        bestSt := asiaL.state
+        bestTxt := "ASIA L: " + asiaL.reason
+    if useLdn and ldnS.state > bestSt
+        bestSt := ldnS.state
+        bestTxt := "LDN S: " + ldnS.reason
+    if useLdn and ldnL.state > bestSt
+        bestSt := ldnL.state
+        bestTxt := "LDN L: " + ldnL.reason
+    if useLunch and lunchShort.state > bestSt
+        bestSt := lunchShort.state
+        bestTxt := "LUNCH S: " + lunchShort.reason
+    if useLunch and lunchLong.state > bestSt
+        bestSt := lunchLong.state
+        bestTxt := "LUNCH L: " + lunchLong.reason
+    if useNY and nyShort.state > bestSt
+        bestSt := nyShort.state
+        bestTxt := "NY S: " + nyShort.reason
+    if useNY and nyLong.state > bestSt
+        bestSt := nyLong.state
+        bestTxt := "NY L: " + nyLong.reason
+    f_c(cp, 13, "Status", bestTxt, color.new(color.white, 20))
