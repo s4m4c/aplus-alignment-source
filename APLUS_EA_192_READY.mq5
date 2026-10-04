@@ -22,7 +22,7 @@
 //|  Time: Europe/Vienna incl. DST, broker offset configurable.                        |
 //+------------------------------------------------------------------------------------+
 #property copyright "A+ Setup Detector"
-#property version   "1.92"
+#property version   "1.93"
 #property description "Lou-A+ V1.6.3 – Asia / London / Lunch / NY, per-range signal timeframe, Multi-Symbol"
 
 #include <Trade\Trade.mqh>
@@ -117,7 +117,7 @@ input double InpAsiaObDepth = 25.0;         // OB: max. entry depth (% of range)
 input double InpAsiaFibDep  = 50.0;         // Fib: min. reclaim depth (% of range)
 input int    InpAsiaMax     = 2;            // Max. trades per Asia session
 input ENUM_SIGTF InpAsiaSigTF = SIG_M5;      // Signal timeframe (confirmation candles)
-input int    InpAsiaCloseH = 0;            // Force-close open trades at (hour, 0 = off)
+input int    InpAsiaCloseH = 11;            // Force-close open trades at (hour, 0 = off)
 input int    InpAsiaCloseM = 0;            // Force-close: minute
 
 input group "2b London range"
@@ -131,7 +131,7 @@ input double InpLdnObDepth  = 25.0;         // OB: max. entry depth (% of range)
 input double InpLdnFibDep   = 50.0;         // Fib: min. reclaim depth (% of range)
 input int    InpLdnMax      = 2;            // Max. trades per London session
 input ENUM_SIGTF InpLdnSigTF  = SIG_M5;      // Signal timeframe (confirmation candles)
-input int    InpLdnCloseH  = 0;            // Force-close open trades at (hour, 0 = off)
+input int    InpLdnCloseH  = 11;            // Force-close open trades at (hour, 0 = off)
 input int    InpLdnCloseM  = 0;            // Force-close: minute
 
 input group "2c Lunch range"
@@ -158,7 +158,7 @@ input double InpNyFibDep    = 50.0;         // Fib: min. reclaim depth (% of ran
 input int    InpNyFibEndH   = 18;           // Fib limit valid until (hour)
 input int    InpNyFibEndM   = 0;            // Fib limit valid until (minute)
 input int    InpNyMax       = 2;            // Max. trades per NY session
-input ENUM_SIGTF InpNySigTF   = SIG_M1;      // Signal timeframe (confirmation candles)
+input ENUM_SIGTF InpNySigTF   = SIG_M5;      // Signal timeframe (confirmation candles)
 input int    InpNyCloseH   = 0;            // Force-close open trades at (hour, 0 = off)
 input int    InpNyCloseM   = 0;            // Force-close: minute
 input bool   InpLdnLocksNY  = false;        // Earlier session TP locks NY
@@ -227,9 +227,9 @@ input ENUM_TPMODE InpTpMode    = TP_DUAL;  // TP-Modell
 input double      InpMinRR     = 1.0;      // Min. CRV (RR) zum ersten TP (0 = aus)
 input double      InpMaxSlPct  = 0.0;      // Max. SL-Abstand (% der Range, 0 = aus)
 input double      InpTp1Level  = 50.0;     // TP1-Level (% der Range, von der Sweep-Seite)
-input double      InpTp2Level  = 75.0;     // TP2-Level (% der Range)
-input double      InpTp1Split  = 70.0;     // Dual: Anteil auf TP1 (%)
-input bool        InpBE        = false;    // Dual: SL auf BE nach TP1
+input double      InpTp2Level  = 100.0;     // TP2-Level (% der Range)
+input double      InpTp1Split  = 50.0;     // Dual: Anteil auf TP1 (%)
+input bool        InpBE        = true;    // Dual: SL auf BE nach TP1
 input double      InpTp2R      = 6.0;      // Custom R: TP2 in R (nur TP-Modell "Custom R")
 input bool        InpCustRNoCap = true;    // Custom R: TP2 darf ueber die Range hinaus laufen
 
