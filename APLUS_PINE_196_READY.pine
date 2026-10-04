@@ -31,7 +31,7 @@
 //
 //  See KNOWN LIMITS at the end of the file.
 // =======================================================================================
-strategy("Lou-A+ V1.9.6", shorttitle = "Lou-A+ 196", overlay = true, process_orders_on_close = true, pyramiding = 10, initial_capital = 10000, margin_long = 0, margin_short = 0, default_qty_type = strategy.fixed, default_qty_value = 1, commission_value = 0, slippage = 0, use_bar_magnifier = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+strategy("Lou-A+ V1.9.6 TradingView Aligned Test", shorttitle = "Lou-A+ 196T", overlay = true, process_orders_on_close = true, pyramiding = 10, initial_capital = 10000, margin_long = 0, margin_short = 0, default_qty_type = strategy.fixed, default_qty_value = 1, commission_value = 0, slippage = 0, use_bar_magnifier = false, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
 // 0. KONSTANTEN
